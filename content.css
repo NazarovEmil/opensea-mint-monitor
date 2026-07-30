@@ -1,0 +1,163 @@
+#osmm-panel,
+#osmm-panel * {
+  box-sizing: border-box;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#osmm-panel {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  left: auto;
+  bottom: auto;
+  width: 380px;
+  max-height: calc(100vh - 28px);
+  display: flex;
+  flex-direction: column;
+  z-index: 2147483647;
+  background: rgba(10, 14, 20, 0.96);
+  color: #e8edf3;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(12px);
+  overflow: hidden;
+  pointer-events: auto;
+  user-select: none;
+}
+
+#osmm-panel.osmm-minimized {
+  width: 240px;
+  max-height: none;
+}
+
+#osmm-panel.osmm-minimized .osmm-body {
+  display: none;
+}
+
+#osmm-panel .osmm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+  cursor: move;
+}
+
+#osmm-panel .osmm-title { font-size: 14px; font-weight: 700; line-height: 1.2; }
+#osmm-panel .osmm-subtitle { margin-top: 2px; font-size: 11px; color: #97a6b5; }
+
+#osmm-panel .osmm-header-actions { display: flex; gap: 6px; }
+#osmm-panel .osmm-body { display: flex; flex-direction: column; min-height: 0; user-select: text; }
+
+#osmm-panel .osmm-controls {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px 0; flex-wrap: wrap;
+}
+#osmm-panel .osmm-controls-compact { padding-top: 8px; }
+#osmm-panel .osmm-controls label { font-size: 11px; color: #b7c3cf; }
+
+#osmm-panel .osmm-controls input[type="number"] {
+  width: 62px; margin-left: 6px; padding: 4px 6px;
+  border-radius: 8px; border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.06); color: #fff; outline: none;
+}
+
+#osmm-panel .osmm-check { display: inline-flex; align-items: center; gap: 6px; }
+
+#osmm-panel .osmm-btn {
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.06);
+  color: #fff; padding: 6px 10px; font-size: 12px;
+  border-radius: 10px; cursor: pointer; transition: 0.15s ease;
+}
+#osmm-panel .osmm-btn:hover { background: rgba(255,255,255,0.14); }
+#osmm-panel .osmm-btn-small { padding: 4px 8px; min-width: 30px; }
+
+#osmm-panel .osmm-summary,
+#osmm-panel .osmm-status {
+  padding: 8px 12px 0; font-size: 11px; color: #9fb0c0;
+}
+#osmm-panel .osmm-summary strong { color: #fff; }
+
+#osmm-panel .osmm-list {
+  padding: 10px 12px 12px; overflow: auto; min-height: 0;
+  display: flex; flex-direction: column; gap: 8px;
+}
+
+#osmm-panel .osmm-empty {
+  padding: 10px; font-size: 12px; color: #aab7c4;
+  border: 1px dashed rgba(255,255,255,0.12); border-radius: 12px;
+}
+
+#osmm-panel .osmm-card {
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.035);
+  border-radius: 14px; padding: 10px;
+}
+#osmm-panel .osmm-card.osmm-card-warm {
+  border-color: rgba(82, 255, 168, 0.45);
+  box-shadow: inset 0 0 0 1px rgba(82, 255, 168, 0.18);
+}
+#osmm-panel .osmm-card.osmm-card-hot {
+  border-color: rgba(255, 179, 71, 0.58);
+  box-shadow: inset 0 0 0 1px rgba(255, 179, 71, 0.22);
+}
+#osmm-panel .osmm-card.osmm-card-profit {
+  border-color: rgba(90, 255, 163, 0.9);
+  box-shadow: inset 0 0 0 1px rgba(90, 255, 163, 0.35),
+              0 0 18px rgba(90, 255, 163, 0.15);
+}
+
+#osmm-panel .osmm-card-top {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+}
+
+#osmm-panel .osmm-name {
+  font-size: 13px; font-weight: 700; color: #fff;
+  line-height: 1.25; word-break: break-word;
+}
+
+#osmm-panel .osmm-name .osmm-verified {
+  color: #7fc0ff; font-size: 11px; margin-left: 4px;
+}
+
+#osmm-panel .osmm-chain {
+  font-size: 10px; color: #cce4ff;
+  background: rgba(72, 152, 255, 0.18);
+  border: 1px solid rgba(72, 152, 255, 0.25);
+  border-radius: 999px; padding: 3px 7px; white-space: nowrap;
+}
+
+#osmm-panel .osmm-metrics,
+#osmm-panel .osmm-meta,
+#osmm-panel .osmm-links,
+#osmm-panel .osmm-stats {
+  display: flex; flex-wrap: wrap; gap: 8px 10px;
+  margin-top: 8px; font-size: 11px; color: #b4c0cc;
+}
+#osmm-panel .osmm-metrics b,
+#osmm-panel .osmm-meta b,
+#osmm-panel .osmm-stats b { color: #fff; }
+
+#osmm-panel .osmm-links a { color: #7fc0ff; text-decoration: none; }
+#osmm-panel .osmm-links a:hover { text-decoration: underline; }
+
+#osmm-panel .osmm-delta-good { color: #6dffb1; font-weight: 700; }
+#osmm-panel .osmm-delta-bad { color: #ff8a8a; font-weight: 700; }
+#osmm-panel .osmm-delta-neutral { color: #cfd7df; font-weight: 700; }
+
+#osmm-panel .osmm-loading { color: #97a6b5; font-style: italic; }
+
+.osmm-dim-repeat {
+  opacity: 0.24 !important;
+  filter: grayscale(1) !important;
+  transition: 0.2s ease;
+}
+
+.osmm-hot-row {
+  outline: 2px solid rgba(90, 255, 163, 0.85) !important;
+  outline-offset: 2px;
+  border-radius: 10px;
+}

@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "OpenSea Mint Monitor MVP",
+  "version": "0.3.0",
+  "description": "Groups OpenSea mint activity by collection and shows a live side panel.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://opensea.io/*",
+        "https://*.opensea.io/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
