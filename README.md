@@ -14,7 +14,8 @@ The panel is draggable, always on top, and its history survives page refreshes.
 
 ## Screenshots
 
-_(add screenshots here after the first run: drag a PNG into this README on GitHub and it will upload automatically)_
+<img width="1280" height="408" alt="image" src="https://github.com/user-attachments/assets/5bdd756f-9cf1-4825-9493-0336edd759c8" />
+
 
 ## Why
 
