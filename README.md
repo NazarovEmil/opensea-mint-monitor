@@ -1,35 +1,35 @@
 # OpenSea Mint Monitor
 
-A Chrome extension that turns the OpenSea live activity feed into a **collection-grouped mint radar** with live floor price, top offer and profit deltas — right on top of the page.
+A Chrome extension that turns the OpenSea live activity feed into a **collection-grouped mint radar** — right on top of the page.
 
 Instead of watching hundreds of individual NFTs scroll past, you see a compact side panel with:
 
-- collections currently being minted
-- how many mints happened in the last minute and inside your chosen time window
+- collections currently being minted, grouped so you never see the same drop twice
+- a **NEW** section that always shows freshly discovered collections at the top
+- a **SEEN** section for collections you already opened (moved automatically on click)
 - **live floor price and top offer** pulled from OpenSea's own GraphQL API
-- **Δ floor / Δ offer** — how much the floor price is above the mint price (the actual flip profit)
-- filters to show only collections where `floor > mint` or `top offer > mint`
+- filters to keep only collections that already have offers
 
 The panel is draggable, always on top, and its history survives page refreshes.
 
 ## Screenshots
 
-<img width="1526" height="855" alt="image" src="https://github.com/user-attachments/assets/20828104-7894-4da2-887e-65363f46bf7a" />
-
-
+<img width="1840" height="625" alt="image" src="https://github.com/user-attachments/assets/48c721c3-a0ed-4777-8e1f-17d65525dab6" />
 
 ## Why
 
-The default OpenSea activity page (`/activity?activityTypes=mint`) shows a fast-scrolling stream of individual NFTs. It's impossible to spot _which collection_ is being minted right now, and there is no way to filter for the only thing that matters when flipping mints: **is the floor price already above the mint price?**
+The default OpenSea activity page (`/activity?activityTypes=mint`) shows a fast-scrolling stream of individual NFTs. It's impossible to spot _which collection_ is being minted right now, and it's very easy to miss a fresh drop in the noise.
 
-This extension solves both problems without leaving the OpenSea page.
+This extension solves that without leaving the OpenSea page.
 
 ## Features
 
 - **Collection grouping** — no more scrolling through hundreds of `#1234` mints of the same collection.
-- **Persistent history** — configurable retention window (default 60 minutes); data survives `F5`.
+- **NEW / SEEN sections** — freshly discovered collections stay at the top of NEW. As soon as you click "open collection", the card moves into SEEN, so what you have not looked at yet is always front and center.
+- **NEW badge and pulse** — brand-new collections get a blue border, a `NEW` badge and a short one-time pulse for 60 seconds after discovery.
+- **Persistent history** — configurable retention window (default 60 minutes); data and your "seen" list survive `F5`.
 - **Live floor and top offer** — pulled from the same OpenSea GraphQL endpoint the site uses for its hover tooltips.
-- **Profit filters** — show only collections where floor / top offer exceed the mint price by X%.
+- **Offer filters** — `has any offer` (collection has at least one offer > 0) and `offer > mint` (top offer is above the mint price).
 - **Multi-chain** — works with every chain OpenSea displays: Ethereum, Base, Polygon, Arbitrum, Robinhood Chain, and others.
 - **Draggable panel** — position is saved between sessions.
 - **No API key required** — reuses your existing OpenSea session cookies.
@@ -51,34 +51,38 @@ The extension is not published to the Chrome Web Store yet. Install it as an unp
 
 ## Usage
 
-The panel has three main controls:
+The panel has three number controls:
 
 | Control | What it does |
 |---|---|
 | **window** | How many minutes of history to keep. A collection is dropped if it had no mints in this window. |
 | **min mints** | Show a collection only if it had at least this many mints inside the window. |
-| **profit ≥** | Threshold in percent for the "profitable" filters and for the green highlight. |
 
-Two toggles:
+Two independent offer toggles:
 
-- **only floor > mint** — hide everything except collections where the floor price is already above the mint price by `profit ≥ N%`.
-- **only offer > mint** — hide everything except collections that already have an offer higher than the mint price.
+- **has any offer** — hide collections without a single active offer. Useful because a collection with any real bid is more likely to be interesting than one with none.
+- **offer > mint** — hide everything except collections where the current top offer is higher than the mint price. Rare, but very useful when it happens.
 
 Each card shows:
 
 - **1m / total** — mints in the last minute / total mints inside the window.
-- **mint / floor / offer** — current prices.
-- **Δ floor / Δ offer** — percentage difference between floor/offer and the mint price. Green = profit, red = loss.
+- **mint / floor / offer** — current prices from OpenSea.
 - **24h vol / items / owners** — collection health signals.
 
-Profitable collections (`Δ floor ≥ profit ≥`) are highlighted green and sorted to the top.
+Cards are grouped into two sections:
+
+- **NEW** — collections you have not opened yet. Freshest at the top.
+- **SEEN** — collections where you already clicked "open collection". Click the SEEN header to hide or show this section.
+
+Collections discovered less than 60 seconds ago get a blue border, a `NEW` badge and pulse once — so you notice them even if you were looking somewhere else on the page.
 
 ## How it works
 
 - A `MutationObserver` watches OpenSea's activity feed for new rows and parses collection name, chain, mint price and timestamp from the DOM.
 - Events are stored in `localStorage`, so page refreshes never lose history inside the retention window.
 - For each new collection the extension calls OpenSea's public GraphQL endpoint (`gql.opensea.io`) using the same persisted query (`CollectionPreviewTooltipContentQuery`) that the site uses when you hover over a collection. This returns floor price, top offer, 24h volume, supply and owner counts.
-- Fetches are rate-limited to ~2.5 req/sec and cached for 2 minutes per collection.
+- Fetches are rate-limited to at most ~2.5 req/sec per collection and cached for 2 minutes.
+- The list of collections you have already opened is stored separately and kept for a week, so a collection you looked at 3 days ago will not resurface as "new" if it mints again today.
 
 Everything runs entirely in the browser. No servers, no API keys, no tracking.
 
@@ -101,10 +105,10 @@ opensea-mint-monitor/
 
 ## Roadmap ideas
 
-- Sound / desktop notifications for high-profit mints
+- Desktop notifications for freshly discovered collections
 - CSV export of tracked collections
 - Firefox port
-- Options page for advanced filters (per-chain thresholds, blocklist, etc.)
+- Options page for advanced filters (per-chain blocklist, name blocklist for scams, etc.)
 - Configurable persisted-query hash via the options page (so users can fix it without editing code)
 
 ## Contributing
