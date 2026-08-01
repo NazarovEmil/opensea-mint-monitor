@@ -1,8 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "OpenSea Mint Monitor MVP",
-  "version": "0.3.0",
-  "description": "Groups OpenSea mint activity by collection and shows a live side panel.",
+  "name": "OpenSea Mint Monitor",
+  "version": "0.4.0",
+  "description": "Groups OpenSea live mint activity by collection with live floor/offer data. Highlights brand-new collections and separates them from ones you already opened.",
+  "author": "Emil Nazarov",
+  "homepage_url": "https://github.com/NazarovEmil/opensea-mint-monitor",
   "content_scripts": [
     {
       "matches": [

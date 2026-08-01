@@ -8,54 +8,51 @@
   log("loaded", location.href);
 
   // ==================== CONFIG ====================
-  // https://github.com/NazarovEmil/opensea-mint-monitor
   // All timings are in milliseconds unless noted otherwise.
   const CONFIG = {
-    // Full scan of the DOM every 1.5s. Fast enough to catch new mints,
-    // slow enough not to burn CPU while OpenSea streams the feed.
+    // Full DOM scan cadence. Fast enough to catch new mints, cheap for the CPU.
     scanIntervalMs: 1500,
 
-    // Rolling "hot right now" window: how many mints happened in the last minute.
-    // Used only for sorting/heat coloring, not for filtering.
+    // "Hot right now" window used only for the row outline and one metric on the card.
     hotWindowMs: 60 * 1000,
 
-    // Defaults for user-facing filters. See onboarding below.
-    defaultWindowMinutes: 60, // Keep and display last 60 minutes of activity.
-    defaultMinMints: 1,       // Show a collection if it had at least 1 mint in the window.
-    defaultMinProfitPct: 20,  // Highlight collections where floor is ≥20% above mint price.
+    // A collection is treated as brand-new for 60 seconds after we first saw it.
+    // During this time it gets a blue border, a "NEW" badge and a short pulse.
+    freshDurationMs: 60 * 1000,
+
+    // Defaults for user-facing filters.
+    defaultWindowMinutes: 60,
+    defaultMinMints: 1,
 
     // LocalStorage keys. Bumped when the schema changes.
     positionStorageKey: "osmm-panel-pos-v1",
-    stateStorageKey: "osmm-state-v3",
-    settingsStorageKey: "osmm-settings-v2",
+    stateStorageKey: "osmm-state-v4",
+    settingsStorageKey: "osmm-settings-v3",
+    seenStorageKey: "osmm-seen-v1",
 
-    // Flush in-memory state to localStorage every 5s so a refresh
-    // (or a crashed tab) does not lose the last minute of collected data.
+    // Flush state to localStorage every 5s so a refresh does not lose data.
     stateSaveIntervalMs: 5000,
 
-    // Hard bounds for the retention window so a user cannot accidentally
-    // store weeks of data (localStorage cap is ~5MB per origin).
-    minRetentionMs: 60 * 1000,          // 1 minute
-    maxRetentionMs: 24 * 60 * 60 * 1000, // 24 hours
+    // Hard bounds for retention so the user cannot fill localStorage.
+    minRetentionMs: 60 * 1000,
+    maxRetentionMs: 24 * 60 * 60 * 1000,
 
-    // OpenSea GraphQL endpoint that powers the hover tooltip on collection
-    // rows. We reuse the exact same persisted query the site itself uses.
+    // We keep the "seen" flag for a collection for a week, then forget it.
+    // If a collection you opened a week ago starts minting again, it should
+    // reappear as new — that is almost certainly a different drop anyway.
+    seenRetentionMs: 7 * 24 * 60 * 60 * 1000,
+
+    // OpenSea GraphQL endpoint that powers the collection tooltip on hover.
     graphqlUrl: "https://gql.opensea.io/graphql",
     tooltipQueryName: "CollectionPreviewTooltipContentQuery",
     tooltipQueryHash: "761282bbf059601b6b02e7c6061a4be4f7958d28a3b386a1305295d9b1d2fd81",
 
-    // Rate-limit for stats requests: at most one request per 400ms.
-    // OpenSea's public rate limit is ~4 req/s per IP, we stay well under it.
+    // Rate limits for the stats fetcher.
     fetchGapMs: 400,
-
-    // How often we allow a stats refresh for the same collection.
-    // Floor/offer/volume rarely change faster than this.
     statsRefreshMs: 2 * 60 * 1000,
-    // If a stats fetch failed, wait at least this long before retrying.
     statsFailRetryMs: 30 * 1000,
 
-    // Safety cap: even in a mint frenzy we never store more than this
-    // many events per collection. Old ones get dropped first.
+    // Safety cap on stored events per collection.
     maxEventsPerCollection: 2000
   };
 
@@ -96,18 +93,21 @@
       windowMinutes: CONFIG.defaultWindowMinutes,
       minMints: CONFIG.defaultMinMints,
       dimRepeats: true,
-      onlyProfitable: false,
       onlyWithOffer: false,
-      minProfitPct: CONFIG.defaultMinProfitPct
+      onlyOfferAboveMint: false,
+      seenCollapsed: false
     },
-    // eventSeen maps eventKey → timestamp, so we never count the same
-    // physical mint twice even if OpenSea re-renders the row.
+    // Source of truth for collections and events. Independent from DOM.
     eventSeen: new Map(),
-    // collections maps collectionKey → { events, name, chain, ... }
-    // This is the source of truth. The visible DOM feed is just an input.
     collections: new Map(),
-    // stats maps slug → { data, loading, ok, fetchedAt } for GraphQL results.
+    // Stats from GraphQL: slug → { data, loading, ok, fetchedAt }.
     stats: new Map(),
+    // Slugs the user has opened by clicking "open collection".
+    // Persisted separately so it survives cache clears of the main state.
+    seen: new Map(),
+    // Collections we already animated with the pulse.
+    // Kept in memory only — pulse should replay on page refresh, that is intentional.
+    pulsed: new Set(),
     fetchQueue: [],
     fetching: false,
     dirty: false,
@@ -169,8 +169,7 @@
   }
 
   function extractPrice(text) {
-    // Match a numeric amount followed by a known token symbol.
-    // USDG is included because Robinhood Chain uses it.
+    // USDG included for Robinhood Chain.
     const m = normalizeText(text).match(/(\d+(?:[.,]\d+)?)\s*(ETH|WETH|POL|MATIC|ARB|OP|AVAX|SOL|RBH|RH|BNB|USDC|USDT|USDG)\b/i);
     if (!m) return null;
     return {
@@ -194,8 +193,6 @@
   }
 
   function detectChain(fullText, row) {
-    // Check accessibility attributes first (chain icon usually has alt text),
-    // fall back to the visible text of the row.
     const accessible = collectAccessibleText(row);
     for (const chain of CHAIN_HINTS) if (chain.regex.test(accessible)) return chain.name;
     for (const chain of CHAIN_HINTS) if (chain.regex.test(fullText)) return chain.name;
@@ -220,16 +217,16 @@
   function collectRowCandidates() {
     const set = new Set();
 
-    // Strategy 1: real <tr> elements in a proper table.
+    // Real <tr> elements.
     document.querySelectorAll('tr[role="row"], tr').forEach((el) => {
       const text = normalizeText(el.innerText || "");
       if (!text || !looksLikeMintRow(text)) return;
       const cells = el.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
-      // Require at least 3 cells so we don't grab header/summary rows.
+      // Require ≥3 cells to skip header/summary rows.
       if (cells.length >= 3) set.add(el);
     });
 
-    // Strategy 2: ARIA rows (OpenSea sometimes renders div-based grids).
+    // ARIA row containers.
     document.querySelectorAll('[role="row"]').forEach((el) => {
       if (el.tagName === "TR") return;
       const text = normalizeText(el.innerText || "");
@@ -238,13 +235,12 @@
       if (cells.length >= 3) set.add(el);
     });
 
-    // Strategy 3: fallback — walk up from any item/collection anchor
-    // until we find an ancestor that looks like a mint row.
+    // Fallback: walk up from item/collection anchors.
     const main = document.querySelector("main") || document.body;
     main.querySelectorAll("a[href]").forEach((anchor) => {
       if (!isItemLink(anchor.href) && !isCollectionLink(anchor.href)) return;
       let el = anchor;
-      // Cap the walk at 10 levels — deeper than that is almost certainly noise.
+      // 10 levels max — deeper is almost certainly noise.
       for (let depth = 0; depth < 10 && el; depth += 1, el = el.parentElement) {
         if (!el) break;
         if (el.id === "osmm-panel") return;
@@ -279,13 +275,12 @@
     const collectionAnchor = anchors.find((a) => isCollectionLink(a.href));
     const itemAnchor = anchors.find((a) => isItemLink(a.href));
 
-    // Grab all leaf-node texts inside the item cell — the first two usually are
-    // "#853" (token id) and "Hoodboyzz" (collection name).
+    // Leaf-node texts in the item cell: usually "#853" then "Hoodboyzz".
     const leafTexts = [];
     search.querySelectorAll("*").forEach((el) => {
       if (el.children.length === 0) {
         const t = normalizeText(el.textContent || "");
-        // 2..120 chars: filters out empty spans and giant paragraphs.
+        // 2..120 chars filters empty spans and giant paragraphs.
         if (t && t.length >= 2 && t.length <= 120) leafTexts.push(t);
       }
     });
@@ -303,7 +298,7 @@
     }
 
     if (!collectionName) {
-      // Skip subtitles that are just token ids like "#123".
+      // Skip token-id subtitles like "#123".
       if (subtitle && !/^#\d+/.test(subtitle)) collectionName = subtitle;
       else collectionName = title;
     }
@@ -327,7 +322,7 @@
 
   function extractTimeFromRow(row) {
     const cells = [...row.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
-    // Scan from the last cell backwards — "TIME" is usually the rightmost column.
+    // Scan from the last cell backwards — "TIME" is usually rightmost.
     for (let i = cells.length - 1; i >= 0; i -= 1) {
       const t = normalizeText(cells[i].innerText || "");
       if (/(\bjust now\b|\d+\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*(ago)?)/i.test(t)) {
@@ -353,7 +348,7 @@
     const collectionKey = `${chain.toLowerCase()}::${collectionKeyBase}`;
 
     // Bucket time into 30-second slots so "3m ago" → "4m ago" transitions
-    // don't create phantom duplicate events for the same physical mint.
+    // do not create phantom duplicate events for the same physical mint.
     const itemUrl = info.itemUrl || "";
     const timeBucket = Math.round(seenAt / 30000);
     const eventKey = `${collectionKey}|${itemUrl}|${timeBucket}`;
@@ -371,18 +366,21 @@
 
   function addEvent(meta) {
     let col = state.collections.get(meta.collectionKey);
+    const isFirstTimeSeen = !col;
     if (!col) {
       col = {
         key: meta.collectionKey, slug: meta.slug,
         name: meta.name, chain: meta.chain,
         collectionUrl: meta.collectionUrl, itemUrl: meta.itemUrl,
         firstSeen: meta.seenAt, lastSeen: meta.seenAt,
+        // discoveredAt is when the extension first noticed this collection,
+        // independent from the mint timestamp. Used for NEW badge / pulse.
+        discoveredAt: Date.now(),
         lastPrice: meta.price, events: []
       };
       state.collections.set(meta.collectionKey, col);
     }
 
-    // Enrich existing collection with anything new we learned this scan.
     col.name = meta.name || col.name;
     col.chain = meta.chain || col.chain;
     col.collectionUrl = meta.collectionUrl || col.collectionUrl;
@@ -394,13 +392,13 @@
 
     col.events.push({ ts: meta.seenAt, price: meta.price });
 
-    // Trim to the safety cap — drop the oldest events first.
     if (col.events.length > CONFIG.maxEventsPerCollection) {
       col.events.splice(0, col.events.length - CONFIG.maxEventsPerCollection);
     }
 
     state.dirty = true;
     if (col.slug) enqueueStatsFetch(col.slug);
+    return isFirstTimeSeen;
   }
 
   function pruneByRetention() {
@@ -422,6 +420,12 @@
         col.firstSeen = col.events[0].ts;
       }
     }
+
+    // Forget stale "seen" flags so ancient collections don't clog storage.
+    const seenCutoff = now - CONFIG.seenRetentionMs;
+    for (const [k, ts] of state.seen.entries()) {
+      if (ts < seenCutoff) state.seen.delete(k);
+    }
   }
 
   function getMetrics(col, now) {
@@ -435,8 +439,6 @@
   }
 
   // ==================== PERSISTENCE ====================
-  // We snapshot both settings and event history to localStorage so a
-  // page refresh (or accidental navigation) doesn't wipe the last hour.
 
   function saveSettings() {
     try { localStorage.setItem(CONFIG.settingsStorageKey, JSON.stringify(state.settings)); } catch (e) {}
@@ -451,6 +453,23 @@
     } catch (e) {}
   }
 
+  function saveSeen() {
+    try { localStorage.setItem(CONFIG.seenStorageKey, JSON.stringify([...state.seen.entries()])); } catch (e) {}
+  }
+
+  function loadSeen() {
+    try {
+      const raw = localStorage.getItem(CONFIG.seenStorageKey);
+      if (!raw) return;
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return;
+      const cutoff = Date.now() - CONFIG.seenRetentionMs;
+      arr.forEach(([k, ts]) => {
+        if (typeof k === "string" && typeof ts === "number" && ts >= cutoff) state.seen.set(k, ts);
+      });
+    } catch (e) {}
+  }
+
   function flushState() {
     if (!state.dirty) return;
     state.dirty = false;
@@ -461,6 +480,7 @@
           key: c.key, slug: c.slug, name: c.name, chain: c.chain,
           collectionUrl: c.collectionUrl, itemUrl: c.itemUrl,
           firstSeen: c.firstSeen, lastSeen: c.lastSeen,
+          discoveredAt: c.discoveredAt,
           lastPrice: c.lastPrice, events: c.events
         })),
         eventSeen: [...state.eventSeen.entries()]
@@ -478,8 +498,7 @@
       const payload = JSON.parse(raw);
       if (!payload || !Array.isArray(payload.collections)) return;
 
-      const now = Date.now();
-      const cutoff = now - getRetentionMs();
+      const cutoff = Date.now() - getRetentionMs();
 
       payload.collections.forEach((c) => {
         const events = (c.events || []).filter((e) => e && e.ts >= cutoff);
@@ -490,6 +509,9 @@
           collectionUrl: c.collectionUrl || null,
           itemUrl: c.itemUrl || null,
           firstSeen: events[0].ts, lastSeen: events[events.length - 1].ts,
+          // discoveredAt from a previous session is preserved so restored
+          // cards do not falsely show as "NEW" after a refresh.
+          discoveredAt: c.discoveredAt || events[0].ts,
           lastPrice: c.lastPrice || null,
           events
         });
@@ -547,7 +569,7 @@
         console.warn(LOG_PREFIX, "stats fetch failed for", slug, err);
         state.stats.set(slug, { loading: false, ok: false, fetchedAt: Date.now(), error: String(err && err.message || err) });
       }
-      // Enforce the rate-limit gap between consecutive fetches.
+      // Rate-limit gap between requests.
       await new Promise((r) => setTimeout(r, CONFIG.fetchGapMs));
     }
 
@@ -563,8 +585,7 @@
     }));
 
     const res = await fetch(url.toString(), {
-      // credentials: "include" reuses the user's OpenSea session cookies,
-      // otherwise the API may return 401/403.
+      // credentials: "include" reuses the user's OpenSea session cookies.
       method: "GET", credentials: "include",
       headers: { accept: "application/json" }
     });
@@ -574,8 +595,7 @@
   }
 
   function parsePriceObj(obj) {
-    // OpenSea's GraphQL wraps prices in several shapes depending on context.
-    // Try the common ones in order of specificity.
+    // OpenSea wraps prices in several shapes depending on context.
     if (!obj) return null;
     if (typeof obj.unit === "number") return { unit: obj.unit, symbol: obj.symbol || "" };
     if (obj.token && typeof obj.token.unit === "number") return { unit: obj.token.unit, symbol: obj.token.symbol || "" };
@@ -616,33 +636,10 @@
     };
   }
 
-  function computeProfit(col, stats) {
-    if (!stats) return { deltaFloorPct: null, deltaOfferPct: null, effectiveMint: null };
-
-    // Prefer the authoritative mint price from the drop configuration.
-    // Fall back to whatever price we scraped from the mint row.
-    let effectiveMint = null;
-    if (stats.mintPrice && typeof stats.mintPrice.unit === "number") {
-      effectiveMint = stats.mintPrice.unit;
-    } else if (col.lastPrice && typeof col.lastPrice.amount === "number") {
-      effectiveMint = col.lastPrice.amount;
-    }
-
-    let deltaFloorPct = null;
-    let deltaOfferPct = null;
-
-    if (effectiveMint !== null && stats.floor && typeof stats.floor.unit === "number") {
-      if (effectiveMint > 0) deltaFloorPct = ((stats.floor.unit - effectiveMint) / effectiveMint) * 100;
-      // Free mint (mint = 0) with a positive floor: represent as a huge delta
-      // so it sorts to the top but doesn't overflow the number formatter.
-      else if (stats.floor.unit > 0) deltaFloorPct = 9999;
-    }
-    if (effectiveMint !== null && stats.topOffer && typeof stats.topOffer.unit === "number") {
-      if (effectiveMint > 0) deltaOfferPct = ((stats.topOffer.unit - effectiveMint) / effectiveMint) * 100;
-      else if (stats.topOffer.unit > 0) deltaOfferPct = 9999;
-    }
-
-    return { deltaFloorPct, deltaOfferPct, effectiveMint };
+  function getEffectiveMintPrice(col, stats) {
+    if (stats && stats.mintPrice && typeof stats.mintPrice.unit === "number") return stats.mintPrice.unit;
+    if (col.lastPrice && typeof col.lastPrice.amount === "number") return col.lastPrice.amount;
+    return null;
   }
 
   // ==================== FORMATTING ====================
@@ -671,12 +668,6 @@
     return `${unit} ${symbol || ""}`.trim();
   }
 
-  function formatDeltaPct(pct) {
-    if (pct === null || pct === undefined || !isFinite(pct)) return "—";
-    const sign = pct >= 0 ? "+" : "";
-    return `${sign}${pct.toFixed(0)}%`;
-  }
-
   // ==================== POSITION / DRAG ====================
 
   function loadSavedPosition() {
@@ -695,7 +686,7 @@
 
   function applyPosition(left, top) {
     if (!state.panel) return;
-    // Keep the panel visible: leave at least 100px on the right and 40px on the bottom.
+    // Keep the panel on-screen: at least 100px on the right, 40px on the bottom.
     const maxLeft = Math.max(0, window.innerWidth - 100);
     const maxTop = Math.max(0, window.innerHeight - 40);
     const safeLeft = Math.min(Math.max(0, left), maxLeft);
@@ -709,7 +700,7 @@
   function snapTopRight() {
     if (!state.panel) return;
     const width = state.panel.offsetWidth || 380;
-    // 14px inset matches the default padding used across OpenSea's UI.
+    // 14px inset matches OpenSea's own UI padding.
     const left = Math.max(0, window.innerWidth - width - 14);
     applyPosition(left, 14);
     savePosition(left, 14);
@@ -781,20 +772,15 @@
             min mints
             <input type="number" min="1" max="9999" step="1" data-setting="minMints" value="${state.settings.minMints}" />
           </label>
-          <label title="Highlight collections where floor is at least this much above the mint price">
-            profit ≥
-            <input type="number" min="0" max="10000" step="5" data-setting="minProfitPct" value="${state.settings.minProfitPct}" />
-            %
-          </label>
         </div>
         <div class="osmm-controls osmm-controls-compact">
-          <label class="osmm-check">
-            <input type="checkbox" data-setting="onlyProfitable" ${state.settings.onlyProfitable ? "checked" : ""} />
-            only floor > mint
-          </label>
-          <label class="osmm-check">
+          <label class="osmm-check" title="Show only collections that have at least one offer of any size">
             <input type="checkbox" data-setting="onlyWithOffer" ${state.settings.onlyWithOffer ? "checked" : ""} />
-            only offer > mint
+            has any offer
+          </label>
+          <label class="osmm-check" title="Show only collections where the top offer is above the mint price">
+            <input type="checkbox" data-setting="onlyOfferAboveMint" ${state.settings.onlyOfferAboveMint ? "checked" : ""} />
+            offer > mint
           </label>
         </div>
         <div class="osmm-summary"></div>
@@ -819,6 +805,19 @@
     state.headerEl.addEventListener("mousedown", onDragStart);
 
     panel.addEventListener("click", (e) => {
+      // Clicks on "open collection" mark the collection as seen.
+      const openLink = e.target.closest("a[data-role='open-collection']");
+      if (openLink) {
+        const key = openLink.dataset.collectionKey;
+        if (key) {
+          state.seen.set(key, Date.now());
+          saveSeen();
+          // Re-render to move the card into the SEEN section.
+          renderPanel();
+        }
+        return;
+      }
+
       const btn = e.target.closest("[data-action]");
       if (!btn) return;
       const action = btn.dataset.action;
@@ -831,6 +830,7 @@
       if (action === "clear") {
         state.eventSeen.clear();
         state.collections.clear();
+        state.pulsed.clear();
         state.dirty = true;
         flushState();
         renderPanel();
@@ -843,6 +843,12 @@
         return;
       }
       if (action === "snap") { snapTopRight(); return; }
+      if (action === "toggle-seen") {
+        state.settings.seenCollapsed = !state.settings.seenCollapsed;
+        saveSettings();
+        renderPanel();
+        return;
+      }
     });
 
     panel.addEventListener("input", (e) => {
@@ -865,7 +871,7 @@
       applyPosition(rect.left, rect.top);
     });
 
-    // Persist state on navigation or tab switch — safety net for the interval flush.
+    // Persist on navigation or tab switch — safety net for the interval flush.
     window.addEventListener("beforeunload", flushState);
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") flushState();
@@ -874,8 +880,8 @@
 
   function ensurePanelOnTop() {
     if (!state.panel) return;
-    // OpenSea occasionally re-renders large chunks of the DOM. Re-append
-    // the panel to guarantee it stays as the last child, above everything else.
+    // OpenSea re-renders large DOM chunks. Re-append to guarantee the panel
+    // stays as the last child of <html>, above everything else.
     const last = document.documentElement.lastElementChild;
     if (last !== state.panel) document.documentElement.appendChild(state.panel);
   }
@@ -892,9 +898,9 @@
       const col = state.collections.get(key);
       if (!col) return;
 
-      // Green outline for collections that are "hot" (many mints in the last minute).
+      // Highlight rows of collections that are hot in the last minute.
+      // Threshold 3 avoids reacting to a single mint.
       const metrics = getMetrics(col, now);
-      // 3+ mints in the last minute qualifies as noticeably active.
       if (metrics.hotCount >= 3) row.classList.add("osmm-hot-row");
 
       if (state.settings.dimRepeats) {
@@ -904,48 +910,56 @@
     });
   }
 
+  function isCollectionFresh(col, now) {
+    return now - col.discoveredAt < CONFIG.freshDurationMs;
+  }
+
+  function collectionPassesFilters(col, stats) {
+    const now = Date.now();
+    const retention = getRetentionMs();
+
+    if (now - col.lastSeen > retention) return false;
+    if (col.events.length < state.settings.minMints) return false;
+
+    const hasAnyOffer = !!(stats && stats.topOffer && typeof stats.topOffer.unit === "number" && stats.topOffer.unit > 0);
+    if (state.settings.onlyWithOffer && !hasAnyOffer) return false;
+
+    if (state.settings.onlyOfferAboveMint) {
+      const mint = getEffectiveMintPrice(col, stats);
+      const offer = stats && stats.topOffer ? stats.topOffer.unit : null;
+      if (mint === null || offer === null) return false;
+      if (!(offer > mint)) return false;
+    }
+    return true;
+  }
+
   function renderPanel() {
     if (!state.panel) return;
 
     const now = Date.now();
     const retention = getRetentionMs();
-    const active = [];
+    const newCards = [];
+    const seenCards = [];
 
     for (const col of state.collections.values()) {
-      // A collection stays visible as long as it had at least `minMints` mints
-      // inside the current retention window. This is exactly what the user asked:
-      // "keep collections that had at least 1 mint in the last N minutes".
-      if (now - col.lastSeen > retention) continue;
-      if (col.events.length < state.settings.minMints) continue;
-
-      const metrics = getMetrics(col, now);
       const statsRec = col.slug ? state.stats.get(col.slug) : null;
       const stats = statsRec && statsRec.ok ? statsRec.data : null;
-      const profit = computeProfit(col, stats);
 
-      if (state.settings.onlyProfitable) {
-        if (profit.deltaFloorPct === null || profit.deltaFloorPct < state.settings.minProfitPct) continue;
-      }
-      if (state.settings.onlyWithOffer) {
-        if (profit.deltaOfferPct === null || profit.deltaOfferPct < state.settings.minProfitPct) continue;
-      }
+      if (!collectionPassesFilters(col, stats)) continue;
 
-      active.push({ col, metrics, stats, statsRec, profit });
+      const bucket = state.seen.has(col.key) ? seenCards : newCards;
+      bucket.push({ col, stats, statsRec });
     }
 
-    // Sort by profit first (best flip opportunities on top),
-    // then by recent activity so live drops always surface.
-    active.sort((a, b) => {
-      const pa = a.profit.deltaFloorPct !== null ? a.profit.deltaFloorPct : -Infinity;
-      const pb = b.profit.deltaFloorPct !== null ? b.profit.deltaFloorPct : -Infinity;
-      if (pb !== pa) return pb - pa;
-      return b.metrics.hotCount - a.metrics.hotCount || b.col.lastSeen - a.col.lastSeen;
-    });
+    // NEW section: freshest at the top so newly-arrived collections are
+    // immediately visible without scrolling.
+    newCards.sort((a, b) => b.col.discoveredAt - a.col.discoveredAt);
+    // SEEN section: most recent activity at the top.
+    seenCards.sort((a, b) => b.col.lastSeen - a.col.lastSeen);
 
     state.summaryEl.innerHTML = `
-      <strong>${active.length}</strong> shown /
-      ${state.collections.size} tracked · window <strong>${Math.round(retention / 60000)}m</strong> ·
-      stats: ${state.stats.size}
+      <strong>${newCards.length}</strong> new · <strong>${seenCards.length}</strong> seen ·
+      window <strong>${Math.round(retention / 60000)}m</strong>
     `;
 
     state.statusEl.textContent = state.paused
@@ -954,79 +968,105 @@
 
     state.debugEl.textContent = `debug: candidate rows=${state.lastRowsFound}, mint rows=${state.lastMintRowsFound}`;
 
-    if (!active.length) {
+    if (!newCards.length && !seenCards.length) {
       state.listEl.innerHTML = `
         <div class="osmm-empty">
           Nothing matches the current filters.<br>
-          Try lowering "min mints" or increasing "window".
+          Try lowering "min mints" or turning off the offer filters.
         </div>
       `;
       return;
     }
 
-    state.listEl.innerHTML = active.map(({ col, metrics, stats, statsRec, profit }) => {
-      const isHotByProfit = profit.deltaFloorPct !== null && profit.deltaFloorPct >= state.settings.minProfitPct;
-      let heatClass;
-      // Priority: profit > raw velocity. A profitable card is always more useful than a fast one.
-      if (isHotByProfit) heatClass = "osmm-card osmm-card-profit";
-      else if (metrics.hotCount >= 4) heatClass = "osmm-card osmm-card-hot";
-      else if (metrics.hotCount >= 2) heatClass = "osmm-card osmm-card-warm";
-      else heatClass = "osmm-card";
+    const parts = [];
 
-      const targetUrl = col.collectionUrl || col.itemUrl || "#";
-      const verified = stats && stats.isVerified ? `<span class="osmm-verified" title="Verified">✓</span>` : "";
+    parts.push(`
+      <div class="osmm-section-header">
+        <span>NEW <span class="osmm-section-count">${newCards.length}</span></span>
+        <span class="osmm-section-toggle">freshest first</span>
+      </div>
+    `);
+    if (newCards.length) {
+      parts.push(newCards.map((c) => renderCard(c, now, false)).join(""));
+    } else {
+      parts.push(`<div class="osmm-empty">No unseen collections right now.</div>`);
+    }
 
-      const floorStr = stats && stats.floor ? formatUnit(stats.floor.unit, stats.floor.symbol)
-        : (statsRec && statsRec.loading ? '<span class="osmm-loading">loading…</span>' : "—");
-      const offerStr = stats && stats.topOffer ? formatUnit(stats.topOffer.unit, stats.topOffer.symbol) : "—";
-      const volStr = stats && stats.volume24h ? formatUnit(stats.volume24h.unit, stats.volume24h.symbol) : "—";
-      const itemsStr = stats && (stats.totalSupply || stats.maxSupply)
-        ? `${stats.totalSupply || "?"}${stats.maxSupply ? " / " + stats.maxSupply : ""}` : "—";
-      const ownersStr = stats && stats.ownerCount !== null ? String(stats.ownerCount) : "—";
-      const mintingBadge = stats && stats.isMinting ? " · <b>minting</b>" : "";
-
-      const deltaFloorClass = profit.deltaFloorPct === null ? "osmm-delta-neutral"
-        : profit.deltaFloorPct > 0 ? "osmm-delta-good" : "osmm-delta-bad";
-      const deltaOfferClass = profit.deltaOfferPct === null ? "osmm-delta-neutral"
-        : profit.deltaOfferPct > 0 ? "osmm-delta-good" : "osmm-delta-bad";
-
-      const mintPriceStr = profit.effectiveMint !== null ? `${profit.effectiveMint}`
-        : (col.lastPrice ? formatPrice(col.lastPrice) : "—");
-
-      return `
-        <div class="${heatClass}">
-          <div class="osmm-card-top">
-            <div class="osmm-name">${escapeHtml(col.name || "Unknown")}${verified}</div>
-            <div class="osmm-chain">${escapeHtml((stats && stats.chainName) || col.chain || "Unknown")}</div>
-          </div>
-          <div class="osmm-metrics">
-            <span>1m: <b>${metrics.hotCount}</b></span>
-            <span>total: <b>${metrics.total}</b></span>${mintingBadge}
-          </div>
-          <div class="osmm-stats">
-            <span>mint: <b>${escapeHtml(mintPriceStr)}</b></span>
-            <span>floor: <b>${floorStr}</b></span>
-            <span>offer: <b>${offerStr}</b></span>
-          </div>
-          <div class="osmm-stats">
-            <span>Δ floor: <b class="${deltaFloorClass}">${escapeHtml(formatDeltaPct(profit.deltaFloorPct))}</b></span>
-            <span>Δ offer: <b class="${deltaOfferClass}">${escapeHtml(formatDeltaPct(profit.deltaOfferPct))}</b></span>
-            <span>24h vol: <b>${volStr}</b></span>
-          </div>
-          <div class="osmm-meta">
-            <span>items: <b>${itemsStr}</b></span>
-            <span>owners: <b>${ownersStr}</b></span>
-            <span>last: <b>${escapeHtml(formatAgo(col.lastSeen, now))}</b></span>
-            <span>first: <b>${escapeHtml(formatAgo(col.firstSeen, now))}</b></span>
-          </div>
-          <div class="osmm-links">
-            <a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer">open collection</a>
-            ${col.itemUrl && col.collectionUrl && col.itemUrl !== col.collectionUrl
-              ? `<a href="${escapeHtml(col.itemUrl)}" target="_blank" rel="noopener noreferrer">last item</a>` : ""}
-          </div>
+    if (seenCards.length) {
+      const toggleLabel = state.settings.seenCollapsed ? "show" : "hide";
+      parts.push(`
+        <div class="osmm-section-header" data-action="toggle-seen">
+          <span>SEEN <span class="osmm-section-count">${seenCards.length}</span></span>
+          <span class="osmm-section-toggle">${toggleLabel}</span>
         </div>
-      `;
-    }).join("");
+      `);
+      if (!state.settings.seenCollapsed) {
+        parts.push(seenCards.map((c) => renderCard(c, now, true)).join(""));
+      }
+    }
+
+    state.listEl.innerHTML = parts.join("");
+  }
+
+  function renderCard({ col, stats, statsRec }, now, isSeen) {
+    const fresh = !isSeen && isCollectionFresh(col, now);
+
+    // The pulse plays once per collection per page load. We use a Set (not
+    // localStorage) so a refresh replays the pulse — that is intentional,
+    // because after F5 you want to see what actually arrived fresh again.
+    const justArrived = fresh && !state.pulsed.has(col.key);
+    if (justArrived) state.pulsed.add(col.key);
+
+    const classes = ["osmm-card"];
+    if (fresh) classes.push("osmm-card-fresh");
+    if (isSeen) classes.push("osmm-card-seen");
+    if (justArrived) classes.push("osmm-card-just-arrived");
+
+    const targetUrl = col.collectionUrl || col.itemUrl || "#";
+    const verified = stats && stats.isVerified ? `<span class="osmm-verified" title="Verified">✓</span>` : "";
+    const newBadge = fresh ? `<span class="osmm-badge-new">NEW</span>` : "";
+
+    const metrics = getMetrics(col, now);
+    const floorStr = stats && stats.floor ? formatUnit(stats.floor.unit, stats.floor.symbol)
+      : (statsRec && statsRec.loading ? '<span class="osmm-loading">loading…</span>' : "—");
+    const offerStr = stats && stats.topOffer ? formatUnit(stats.topOffer.unit, stats.topOffer.symbol) : "—";
+    const volStr = stats && stats.volume24h ? formatUnit(stats.volume24h.unit, stats.volume24h.symbol) : "—";
+    const itemsStr = stats && (stats.totalSupply || stats.maxSupply)
+      ? `${stats.totalSupply || "?"}${stats.maxSupply ? " / " + stats.maxSupply : ""}` : "—";
+    const ownersStr = stats && stats.ownerCount !== null ? String(stats.ownerCount) : "—";
+    const mintingBadge = stats && stats.isMinting ? " · <b>minting</b>" : "";
+    const effectiveMint = getEffectiveMintPrice(col, stats);
+    const mintPriceStr = effectiveMint !== null ? `${effectiveMint}` : (col.lastPrice ? formatPrice(col.lastPrice) : "—");
+
+    return `
+      <div class="${classes.join(" ")}">
+        <div class="osmm-card-top">
+          <div class="osmm-name">${escapeHtml(col.name || "Unknown")}${verified}${newBadge}</div>
+          <div class="osmm-chain">${escapeHtml((stats && stats.chainName) || col.chain || "Unknown")}</div>
+        </div>
+        <div class="osmm-metrics">
+          <span>1m: <b>${metrics.hotCount}</b></span>
+          <span>total: <b>${metrics.total}</b></span>${mintingBadge}
+        </div>
+        <div class="osmm-stats">
+          <span>mint: <b>${escapeHtml(mintPriceStr)}</b></span>
+          <span>floor: <b>${floorStr}</b></span>
+          <span>offer: <b>${offerStr}</b></span>
+        </div>
+        <div class="osmm-meta">
+          <span>24h vol: <b>${volStr}</b></span>
+          <span>items: <b>${itemsStr}</b></span>
+          <span>owners: <b>${ownersStr}</b></span>
+          <span>last: <b>${escapeHtml(formatAgo(col.lastSeen, now))}</b></span>
+        </div>
+        <div class="osmm-links">
+          <a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer"
+             data-role="open-collection" data-collection-key="${escapeHtml(col.key)}">open collection</a>
+          ${col.itemUrl && col.collectionUrl && col.itemUrl !== col.collectionUrl
+            ? `<a href="${escapeHtml(col.itemUrl)}" target="_blank" rel="noopener noreferrer">last item</a>` : ""}
+        </div>
+      </div>
+    `;
   }
 
   // ==================== SCAN LOOP ====================
@@ -1040,6 +1080,7 @@
     state.lastRowsFound = rows.length;
 
     let mintRows = 0;
+    let brandNewCollections = 0;
 
     for (const row of rows) {
       const meta = extractEventMeta(row);
@@ -1054,7 +1095,8 @@
       if (state.eventSeen.has(meta.eventKey)) continue;
 
       state.eventSeen.set(meta.eventKey, meta.seenAt);
-      addEvent(meta);
+      const wasBrandNew = addEvent(meta);
+      if (wasBrandNew) brandNewCollections += 1;
     }
 
     state.lastMintRowsFound = mintRows;
@@ -1066,13 +1108,14 @@
     renderPanel();
 
     log("scan:", "rows=" + rows.length, "mint=" + mintRows,
-        "collections=" + state.collections.size, "events=" + state.eventSeen.size);
+        "collections=" + state.collections.size,
+        "brand-new=" + brandNewCollections);
   }
 
   function scheduleScanSoon() {
     if (scanScheduled) return;
     scanScheduled = true;
-    // 250ms debounce: coalesce bursts of DOM mutations into one scan.
+    // 250ms debounce coalesces DOM mutation bursts into one scan.
     setTimeout(() => { scanScheduled = false; scanPage(); }, 250);
   }
 
@@ -1088,6 +1131,7 @@
 
   function start() {
     loadSettings();
+    loadSeen();
     loadState();
     createPanel();
     attachObserver();
@@ -1100,7 +1144,6 @@
     if (document.body) start();
     else {
       // OpenSea sometimes ships the script before <body> exists.
-      // Wait until the body is attached, then start once.
       const bootObserver = new MutationObserver(() => {
         if (document.body) { bootObserver.disconnect(); start(); }
       });
@@ -1109,8 +1152,7 @@
   }
 
   state.routeKey = `${location.pathname}${location.search}`;
-  // Poll for URL changes: OpenSea is an SPA and doesn't fire full page loads
-  // when the filter chips (chain / market / event type) change.
+  // Poll for URL changes: OpenSea is an SPA, filter chip clicks do not fire full loads.
   state.routeTimerId = setInterval(() => {
     const current = `${location.pathname}${location.search}`;
     if (current !== state.routeKey) {
