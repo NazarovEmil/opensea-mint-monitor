@@ -36,8 +36,32 @@
   background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
   cursor: move;
 }
-#osmm-panel .osmm-title { font-size: 14px; font-weight: 700; line-height: 1.2; }
+#osmm-panel .osmm-title-row {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 14px; font-weight: 700; line-height: 1.2;
+}
+#osmm-panel .osmm-title { font-size: 14px; font-weight: 700; }
 #osmm-panel .osmm-subtitle { margin-top: 2px; font-size: 11px; color: #97a6b5; }
+#osmm-panel .osmm-author-link {
+  color: #b8d4f5; text-decoration: none; border-bottom: 1px dotted rgba(184, 212, 245, 0.35);
+}
+#osmm-panel .osmm-author-link:hover { color: #dceaff; border-bottom-color: rgba(220, 234, 255, 0.7); }
+
+#osmm-panel .osmm-update-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+  background: rgba(255, 196, 0, 0.18);
+  color: #ffe08a;
+  border: 1px solid rgba(255, 196, 0, 0.45);
+  text-decoration: none;
+  transition: 0.15s ease;
+}
+#osmm-panel .osmm-update-badge:hover {
+  background: rgba(255, 196, 0, 0.32);
+  color: #fff2b8;
+}
+
 #osmm-panel .osmm-header-actions { display: flex; gap: 6px; }
 #osmm-panel .osmm-body { display: flex; flex-direction: column; min-height: 0; user-select: text; }
 
@@ -87,9 +111,7 @@
   border-radius: 999px; padding: 1px 8px;
   font-size: 10px; color: #cfd7df; letter-spacing: 0.04em;
 }
-#osmm-panel .osmm-section-toggle {
-  font-size: 10px; color: #7fc0ff; margin-left: 6px;
-}
+#osmm-panel .osmm-section-toggle { font-size: 10px; color: #7fc0ff; margin-left: 6px; }
 
 #osmm-panel .osmm-empty {
   padding: 10px; font-size: 12px; color: #aab7c4;
@@ -125,7 +147,6 @@
 #osmm-panel .osmm-card-top {
   display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
 }
-
 #osmm-panel .osmm-name {
   font-size: 13px; font-weight: 700; color: #fff;
   line-height: 1.25; word-break: break-word;

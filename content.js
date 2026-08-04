@@ -29,6 +29,7 @@
     stateStorageKey: "osmm-state-v4",
     settingsStorageKey: "osmm-settings-v3",
     seenStorageKey: "osmm-seen-v1",
+    updateCheckStorageKey: "osmm-update-check-v1",
 
     // Flush state to localStorage every 5s so a refresh does not lose data.
     stateSaveIntervalMs: 5000,
@@ -37,9 +38,8 @@
     minRetentionMs: 60 * 1000,
     maxRetentionMs: 24 * 60 * 60 * 1000,
 
-    // We keep the "seen" flag for a collection for a week, then forget it.
-    // If a collection you opened a week ago starts minting again, it should
-    // reappear as new — that is almost certainly a different drop anyway.
+    // "Seen" flag TTL: after 7 days we forget. If a collection you opened a
+    // week ago starts minting again, it's almost certainly a different drop.
     seenRetentionMs: 7 * 24 * 60 * 60 * 1000,
 
     // OpenSea GraphQL endpoint that powers the collection tooltip on hover.
@@ -53,7 +53,15 @@
     statsFailRetryMs: 30 * 1000,
 
     // Safety cap on stored events per collection.
-    maxEventsPerCollection: 2000
+    maxEventsPerCollection: 2000,
+
+    // Update check: latest release on GitHub. We poll at most every 24 hours,
+    // which costs 4 requests/day against the 60/hour unauthenticated limit.
+    updateCheckIntervalMs: 24 * 60 * 60 * 1000,
+    githubReleasesUrl: "https://api.github.com/repos/NazarovEmil/opensea-mint-monitor/releases/latest",
+    repoUrl: "https://github.com/NazarovEmil/opensea-mint-monitor",
+    authorChannelUrl: "https://t.me/mdropsss",
+    authorChannelLabel: "@mdropsss"
   };
 
   // Known chain names — used to tag rows even when OpenSea only shows an icon.
@@ -97,20 +105,15 @@
       onlyOfferAboveMint: false,
       seenCollapsed: false
     },
-    // Source of truth for collections and events. Independent from DOM.
     eventSeen: new Map(),
     collections: new Map(),
-    // Stats from GraphQL: slug → { data, loading, ok, fetchedAt }.
     stats: new Map(),
-    // Slugs the user has opened by clicking "open collection".
-    // Persisted separately so it survives cache clears of the main state.
     seen: new Map(),
-    // Collections we already animated with the pulse.
-    // Kept in memory only — pulse should replay on page refresh, that is intentional.
     pulsed: new Set(),
     fetchQueue: [],
     fetching: false,
     dirty: false,
+    updateAvailable: null, // { latestVersion, url } or null
     drag: { active: false, startX: 0, startY: 0, startLeft: 0, startTop: 0 }
   };
 
@@ -212,12 +215,78 @@
     return Math.max(CONFIG.minRetentionMs, Math.min(CONFIG.maxRetentionMs, requested));
   }
 
+  // ==================== VERSION CHECK ====================
+
+  // Compare semver-ish strings like "0.4.1" vs "0.4.10". Returns >0, 0, <0.
+  function compareVersions(a, b) {
+    const pa = String(a).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+    const pb = String(b).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i += 1) {
+      const diff = (pa[i] || 0) - (pb[i] || 0);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  }
+
+  function getInstalledVersion() {
+    try {
+      return (chrome && chrome.runtime && chrome.runtime.getManifest().version) || "0.0.0";
+    } catch (e) {
+      return "0.0.0";
+    }
+  }
+
+  async function checkForUpdate() {
+    // Skip if we checked recently.
+    try {
+      const raw = localStorage.getItem(CONFIG.updateCheckStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.checkedAt && Date.now() - parsed.checkedAt < CONFIG.updateCheckIntervalMs) {
+          if (parsed.updateAvailable) {
+            state.updateAvailable = parsed.updateAvailable;
+            renderPanel();
+          }
+          return;
+        }
+      }
+    } catch (e) {}
+
+    try {
+      const res = await fetch(CONFIG.githubReleasesUrl, {
+        method: "GET",
+        headers: { accept: "application/vnd.github+json" }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const latest = data && data.tag_name ? data.tag_name : null;
+      if (!latest) return;
+
+      const installed = getInstalledVersion();
+      const isNewer = compareVersions(latest, installed) > 0;
+      const updateAvailable = isNewer
+        ? { latestVersion: latest, url: (data.html_url || CONFIG.repoUrl) }
+        : null;
+
+      localStorage.setItem(CONFIG.updateCheckStorageKey, JSON.stringify({
+        checkedAt: Date.now(),
+        installedAtCheck: installed,
+        updateAvailable
+      }));
+
+      state.updateAvailable = updateAvailable;
+      renderPanel();
+    } catch (err) {
+      log("update check failed:", err);
+    }
+  }
+
   // ==================== ROW EXTRACTION ====================
 
   function collectRowCandidates() {
     const set = new Set();
 
-    // Real <tr> elements.
     document.querySelectorAll('tr[role="row"], tr').forEach((el) => {
       const text = normalizeText(el.innerText || "");
       if (!text || !looksLikeMintRow(text)) return;
@@ -226,7 +295,6 @@
       if (cells.length >= 3) set.add(el);
     });
 
-    // ARIA row containers.
     document.querySelectorAll('[role="row"]').forEach((el) => {
       if (el.tagName === "TR") return;
       const text = normalizeText(el.innerText || "");
@@ -235,19 +303,16 @@
       if (cells.length >= 3) set.add(el);
     });
 
-    // Fallback: walk up from item/collection anchors.
     const main = document.querySelector("main") || document.body;
     main.querySelectorAll("a[href]").forEach((anchor) => {
       if (!isItemLink(anchor.href) && !isCollectionLink(anchor.href)) return;
       let el = anchor;
-      // 10 levels max — deeper is almost certainly noise.
       for (let depth = 0; depth < 10 && el; depth += 1, el = el.parentElement) {
         if (!el) break;
         if (el.id === "osmm-panel") return;
         if (el.closest && el.closest("#osmm-panel")) return;
         const text = normalizeText(el.innerText || "");
         if (!text || !looksLikeMintRow(text)) continue;
-        // 10..2000 chars: shorter is a badge, longer is the whole feed container.
         if (text.length < 10 || text.length > 2000) continue;
         set.add(el);
         break;
@@ -275,12 +340,10 @@
     const collectionAnchor = anchors.find((a) => isCollectionLink(a.href));
     const itemAnchor = anchors.find((a) => isItemLink(a.href));
 
-    // Leaf-node texts in the item cell: usually "#853" then "Hoodboyzz".
     const leafTexts = [];
     search.querySelectorAll("*").forEach((el) => {
       if (el.children.length === 0) {
         const t = normalizeText(el.textContent || "");
-        // 2..120 chars filters empty spans and giant paragraphs.
         if (t && t.length >= 2 && t.length <= 120) leafTexts.push(t);
       }
     });
@@ -298,7 +361,6 @@
     }
 
     if (!collectionName) {
-      // Skip token-id subtitles like "#123".
       if (subtitle && !/^#\d+/.test(subtitle)) collectionName = subtitle;
       else collectionName = title;
     }
@@ -322,7 +384,6 @@
 
   function extractTimeFromRow(row) {
     const cells = [...row.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
-    // Scan from the last cell backwards — "TIME" is usually rightmost.
     for (let i = cells.length - 1; i >= 0; i -= 1) {
       const t = normalizeText(cells[i].innerText || "");
       if (/(\bjust now\b|\d+\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\s*(ago)?)/i.test(t)) {
@@ -347,8 +408,7 @@
     const collectionKeyBase = slug || slugifySoft(info.name || "unknown");
     const collectionKey = `${chain.toLowerCase()}::${collectionKeyBase}`;
 
-    // Bucket time into 30-second slots so "3m ago" → "4m ago" transitions
-    // do not create phantom duplicate events for the same physical mint.
+    // 30s bucket dedupes "3m ago" → "4m ago" transitions for the same mint.
     const itemUrl = info.itemUrl || "";
     const timeBucket = Math.round(seenAt / 30000);
     const eventKey = `${collectionKey}|${itemUrl}|${timeBucket}`;
@@ -373,8 +433,6 @@
         name: meta.name, chain: meta.chain,
         collectionUrl: meta.collectionUrl, itemUrl: meta.itemUrl,
         firstSeen: meta.seenAt, lastSeen: meta.seenAt,
-        // discoveredAt is when the extension first noticed this collection,
-        // independent from the mint timestamp. Used for NEW badge / pulse.
         discoveredAt: Date.now(),
         lastPrice: meta.price, events: []
       };
@@ -403,8 +461,7 @@
 
   function pruneByRetention() {
     const now = Date.now();
-    const retention = getRetentionMs();
-    const cutoff = now - retention;
+    const cutoff = now - getRetentionMs();
 
     for (const [k, ts] of state.eventSeen.entries()) {
       if (ts < cutoff) state.eventSeen.delete(k);
@@ -421,7 +478,6 @@
       }
     }
 
-    // Forget stale "seen" flags so ancient collections don't clog storage.
     const seenCutoff = now - CONFIG.seenRetentionMs;
     for (const [k, ts] of state.seen.entries()) {
       if (ts < seenCutoff) state.seen.delete(k);
@@ -509,8 +565,6 @@
           collectionUrl: c.collectionUrl || null,
           itemUrl: c.itemUrl || null,
           firstSeen: events[0].ts, lastSeen: events[events.length - 1].ts,
-          // discoveredAt from a previous session is preserved so restored
-          // cards do not falsely show as "NEW" after a refresh.
           discoveredAt: c.discoveredAt || events[0].ts,
           lastPrice: c.lastPrice || null,
           events
@@ -569,7 +623,6 @@
         console.warn(LOG_PREFIX, "stats fetch failed for", slug, err);
         state.stats.set(slug, { loading: false, ok: false, fetchedAt: Date.now(), error: String(err && err.message || err) });
       }
-      // Rate-limit gap between requests.
       await new Promise((r) => setTimeout(r, CONFIG.fetchGapMs));
     }
 
@@ -585,7 +638,6 @@
     }));
 
     const res = await fetch(url.toString(), {
-      // credentials: "include" reuses the user's OpenSea session cookies.
       method: "GET", credentials: "include",
       headers: { accept: "application/json" }
     });
@@ -595,7 +647,6 @@
   }
 
   function parsePriceObj(obj) {
-    // OpenSea wraps prices in several shapes depending on context.
     if (!obj) return null;
     if (typeof obj.unit === "number") return { unit: obj.unit, symbol: obj.symbol || "" };
     if (obj.token && typeof obj.token.unit === "number") return { unit: obj.token.unit, symbol: obj.token.symbol || "" };
@@ -686,7 +737,6 @@
 
   function applyPosition(left, top) {
     if (!state.panel) return;
-    // Keep the panel on-screen: at least 100px on the right, 40px on the bottom.
     const maxLeft = Math.max(0, window.innerWidth - 100);
     const maxTop = Math.max(0, window.innerHeight - 40);
     const safeLeft = Math.min(Math.max(0, left), maxLeft);
@@ -700,7 +750,6 @@
   function snapTopRight() {
     if (!state.panel) return;
     const width = state.panel.offsetWidth || 380;
-    // 14px inset matches OpenSea's own UI padding.
     const left = Math.max(0, window.innerWidth - width - 14);
     applyPosition(left, 14);
     savePosition(left, 14);
@@ -745,8 +794,14 @@
     panel.innerHTML = `
       <div class="osmm-header" data-role="drag-handle">
         <div>
-          <div class="osmm-title">OpenSea Mint Monitor</div>
-          <div class="osmm-subtitle">drag me · persistent history</div>
+          <div class="osmm-title-row">
+            <span class="osmm-title">OpenSea Mint Monitor</span>
+            <span class="osmm-update-slot"></span>
+          </div>
+          <div class="osmm-subtitle">
+            by <a href="${escapeHtml(CONFIG.authorChannelUrl)}" target="_blank" rel="noopener noreferrer" class="osmm-author-link">${escapeHtml(CONFIG.authorChannelLabel)}</a>
+            · drag me
+          </div>
         </div>
         <div class="osmm-header-actions">
           <button class="osmm-btn osmm-btn-small" data-action="snap" type="button" title="Snap to top-right">⇱</button>
@@ -812,7 +867,6 @@
         if (key) {
           state.seen.set(key, Date.now());
           saveSeen();
-          // Re-render to move the card into the SEEN section.
           renderPanel();
         }
         return;
@@ -871,7 +925,6 @@
       applyPosition(rect.left, rect.top);
     });
 
-    // Persist on navigation or tab switch — safety net for the interval flush.
     window.addEventListener("beforeunload", flushState);
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") flushState();
@@ -880,8 +933,6 @@
 
   function ensurePanelOnTop() {
     if (!state.panel) return;
-    // OpenSea re-renders large DOM chunks. Re-append to guarantee the panel
-    // stays as the last child of <html>, above everything else.
     const last = document.documentElement.lastElementChild;
     if (last !== state.panel) document.documentElement.appendChild(state.panel);
   }
@@ -898,8 +949,6 @@
       const col = state.collections.get(key);
       if (!col) return;
 
-      // Highlight rows of collections that are hot in the last minute.
-      // Threshold 3 avoids reacting to a single mint.
       const metrics = getMetrics(col, now);
       if (metrics.hotCount >= 3) row.classList.add("osmm-hot-row");
 
@@ -916,9 +965,7 @@
 
   function collectionPassesFilters(col, stats) {
     const now = Date.now();
-    const retention = getRetentionMs();
-
-    if (now - col.lastSeen > retention) return false;
+    if (now - col.lastSeen > getRetentionMs()) return false;
     if (col.events.length < state.settings.minMints) return false;
 
     const hasAnyOffer = !!(stats && stats.topOffer && typeof stats.topOffer.unit === "number" && stats.topOffer.unit > 0);
@@ -933,8 +980,28 @@
     return true;
   }
 
+  function renderUpdateSlot() {
+    if (!state.panel) return;
+    const slot = state.panel.querySelector(".osmm-update-slot");
+    if (!slot) return;
+    if (state.updateAvailable) {
+      slot.innerHTML = `
+        <a class="osmm-update-badge"
+           href="${escapeHtml(state.updateAvailable.url)}"
+           target="_blank" rel="noopener noreferrer"
+           title="New version ${escapeHtml(state.updateAvailable.latestVersion)} available (installed ${escapeHtml(getInstalledVersion())})">
+          ↑ update
+        </a>
+      `;
+    } else {
+      slot.innerHTML = "";
+    }
+  }
+
   function renderPanel() {
     if (!state.panel) return;
+
+    renderUpdateSlot();
 
     const now = Date.now();
     const retention = getRetentionMs();
@@ -944,17 +1011,13 @@
     for (const col of state.collections.values()) {
       const statsRec = col.slug ? state.stats.get(col.slug) : null;
       const stats = statsRec && statsRec.ok ? statsRec.data : null;
-
       if (!collectionPassesFilters(col, stats)) continue;
 
       const bucket = state.seen.has(col.key) ? seenCards : newCards;
       bucket.push({ col, stats, statsRec });
     }
 
-    // NEW section: freshest at the top so newly-arrived collections are
-    // immediately visible without scrolling.
     newCards.sort((a, b) => b.col.discoveredAt - a.col.discoveredAt);
-    // SEEN section: most recent activity at the top.
     seenCards.sort((a, b) => b.col.lastSeen - a.col.lastSeen);
 
     state.summaryEl.innerHTML = `
@@ -1010,10 +1073,6 @@
 
   function renderCard({ col, stats, statsRec }, now, isSeen) {
     const fresh = !isSeen && isCollectionFresh(col, now);
-
-    // The pulse plays once per collection per page load. We use a Set (not
-    // localStorage) so a refresh replays the pulse — that is intentional,
-    // because after F5 you want to see what actually arrived fresh again.
     const justArrived = fresh && !state.pulsed.has(col.key);
     if (justArrived) state.pulsed.add(col.key);
 
@@ -1062,8 +1121,6 @@
         <div class="osmm-links">
           <a href="${escapeHtml(targetUrl)}" target="_blank" rel="noopener noreferrer"
              data-role="open-collection" data-collection-key="${escapeHtml(col.key)}">open collection</a>
-          ${col.itemUrl && col.collectionUrl && col.itemUrl !== col.collectionUrl
-            ? `<a href="${escapeHtml(col.itemUrl)}" target="_blank" rel="noopener noreferrer">last item</a>` : ""}
         </div>
       </div>
     `;
@@ -1080,14 +1137,12 @@
     state.lastRowsFound = rows.length;
 
     let mintRows = 0;
-    let brandNewCollections = 0;
 
     for (const row of rows) {
       const meta = extractEventMeta(row);
       if (!meta) continue;
       mintRows += 1;
 
-      // Tag the DOM row so annotateVisibleRows can style it without re-parsing.
       row.dataset.osmmRow = "1";
       row.dataset.osmmCollectionKey = meta.collectionKey;
       row.dataset.osmmEventKey = meta.eventKey;
@@ -1095,8 +1150,7 @@
       if (state.eventSeen.has(meta.eventKey)) continue;
 
       state.eventSeen.set(meta.eventKey, meta.seenAt);
-      const wasBrandNew = addEvent(meta);
-      if (wasBrandNew) brandNewCollections += 1;
+      addEvent(meta);
     }
 
     state.lastMintRowsFound = mintRows;
@@ -1108,14 +1162,12 @@
     renderPanel();
 
     log("scan:", "rows=" + rows.length, "mint=" + mintRows,
-        "collections=" + state.collections.size,
-        "brand-new=" + brandNewCollections);
+        "collections=" + state.collections.size);
   }
 
   function scheduleScanSoon() {
     if (scanScheduled) return;
     scanScheduled = true;
-    // 250ms debounce coalesces DOM mutation bursts into one scan.
     setTimeout(() => { scanScheduled = false; scanPage(); }, 250);
   }
 
@@ -1137,13 +1189,37 @@
     attachObserver();
     if (!state.scanTimerId) state.scanTimerId = setInterval(scanPage, CONFIG.scanIntervalMs);
     if (!state.saveTimerId) state.saveTimerId = setInterval(flushState, CONFIG.stateSaveIntervalMs);
+    checkForUpdate();
     scanPage();
   }
 
+  // Only the /activity page should ever render the panel. This is enforced by
+  // the manifest match patterns, but we double-check inside the script so
+  // that a) URL edge cases like /activity/something never trigger us, and
+  // b) if the user navigates away via SPA routing, the panel disappears.
+  function isActivityPage() {
+    return location.pathname === "/activity";
+  }
+
+  function removePanel() {
+    if (state.panel && state.panel.parentNode) {
+      state.panel.parentNode.removeChild(state.panel);
+    }
+    state.panel = null;
+    state.listEl = null;
+    state.summaryEl = null;
+    state.statusEl = null;
+    state.debugEl = null;
+    state.headerEl = null;
+  }
+
   function boot() {
+    if (!isActivityPage()) {
+      log("not on /activity, standing by");
+      return;
+    }
     if (document.body) start();
     else {
-      // OpenSea sometimes ships the script before <body> exists.
       const bootObserver = new MutationObserver(() => {
         if (document.body) { bootObserver.disconnect(); start(); }
       });
@@ -1152,13 +1228,18 @@
   }
 
   state.routeKey = `${location.pathname}${location.search}`;
-  // Poll for URL changes: OpenSea is an SPA, filter chip clicks do not fire full loads.
   state.routeTimerId = setInterval(() => {
     const current = `${location.pathname}${location.search}`;
-    if (current !== state.routeKey) {
-      state.routeKey = current;
-      log("route change:", current);
-      setTimeout(scanPage, 500);
+    if (current === state.routeKey) return;
+    state.routeKey = current;
+    log("route change:", current);
+
+    if (isActivityPage()) {
+      if (!state.panel) start();
+      else setTimeout(scanPage, 500);
+    } else if (state.panel) {
+      log("left /activity, removing panel");
+      removePanel();
     }
   }, 1000);
 
