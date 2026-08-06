@@ -13,11 +13,10 @@
     // Full DOM scan cadence. Fast enough to catch new mints, cheap for the CPU.
     scanIntervalMs: 1500,
 
-    // "Hot right now" window used only for the row outline and one metric on the card.
+    // "Hot right now" window used for the row outline and one metric on the card.
     hotWindowMs: 60 * 1000,
 
     // A collection is treated as brand-new for 60 seconds after we first saw it.
-    // During this time it gets a blue border, a "NEW" badge and a short pulse.
     freshDurationMs: 60 * 1000,
 
     // Defaults for user-facing filters.
@@ -26,23 +25,22 @@
 
     // LocalStorage keys. Bumped when the schema changes.
     positionStorageKey: "osmm-panel-pos-v1",
-    stateStorageKey: "osmm-state-v4",
-    settingsStorageKey: "osmm-settings-v3",
-    seenStorageKey: "osmm-seen-v1",
+    stateStorageKey: "osmm-state-v5",
+    settingsStorageKey: "osmm-settings-v4",
+    seenStorageKey: "osmm-seen-v2",
     updateCheckStorageKey: "osmm-update-check-v1",
 
-    // Flush state to localStorage every 5s so a refresh does not lose data.
+    // Flush state to localStorage every 5s.
     stateSaveIntervalMs: 5000,
 
-    // Hard bounds for retention so the user cannot fill localStorage.
+    // Hard bounds for retention.
     minRetentionMs: 60 * 1000,
     maxRetentionMs: 24 * 60 * 60 * 1000,
 
-    // "Seen" flag TTL: after 7 days we forget. If a collection you opened a
-    // week ago starts minting again, it's almost certainly a different drop.
+    // "Seen" flag TTL: 7 days.
     seenRetentionMs: 7 * 24 * 60 * 60 * 1000,
 
-    // OpenSea GraphQL endpoint that powers the collection tooltip on hover.
+    // OpenSea GraphQL endpoint.
     graphqlUrl: "https://gql.opensea.io/graphql",
     tooltipQueryName: "CollectionPreviewTooltipContentQuery",
     tooltipQueryHash: "761282bbf059601b6b02e7c6061a4be4f7958d28a3b386a1305295d9b1d2fd81",
@@ -55,16 +53,15 @@
     // Safety cap on stored events per collection.
     maxEventsPerCollection: 2000,
 
-    // Update check: latest release on GitHub. We poll at most every 24 hours,
-    // which costs 4 requests/day against the 60/hour unauthenticated limit.
-    updateCheckIntervalMs: 24 * 60 * 60 * 1000,
+    // Update check every 6 hours (4 requests/day out of 60/hour unauth limit).
+    updateCheckIntervalMs: 6 * 60 * 60 * 1000,
     githubReleasesUrl: "https://api.github.com/repos/NazarovEmil/opensea-mint-monitor/releases/latest",
     repoUrl: "https://github.com/NazarovEmil/opensea-mint-monitor",
     authorChannelUrl: "https://t.me/mdropsss",
     authorChannelLabel: "@mdropsss"
   };
 
-  // Known chain names — used to tag rows even when OpenSea only shows an icon.
+  // Fallback chain detection from row text — used only until GraphQL confirms.
   const CHAIN_HINTS = [
     { name: "Robinhood", regex: /\brobinhood\b|\brbh\b|\brh chain\b/i },
     { name: "Ethereum", regex: /\bethereum\b|\bmainnet\b/i },
@@ -81,13 +78,36 @@
     { name: "Ronin", regex: /\bronin\b/i }
   ];
 
+  // Map various chain identifiers/names into a single canonical bucket used
+  // for keying and de-duplication. Add more as you notice mismatches.
+  const CHAIN_ALIASES = {
+    "ethereum": "ethereum", "eth": "ethereum", "mainnet": "ethereum",
+    "base": "base",
+    "polygon": "polygon", "matic": "polygon", "pol": "polygon",
+    "arbitrum": "arbitrum", "arb": "arbitrum",
+    "optimism": "optimism", "op": "optimism",
+    "avalanche": "avalanche", "avax": "avalanche",
+    "solana": "solana", "sol": "solana",
+    "bnb chain": "bnb", "bnb": "bnb",
+    "blast": "blast",
+    "zora": "zora",
+    "apechain": "apechain", "ape chain": "apechain", "ape": "apechain",
+    "ronin": "ronin",
+    "robinhood": "robinhood", "robinhood chain": "robinhood", "rbh": "robinhood"
+  };
+
+  function canonicalizeChain(name) {
+    if (!name) return null;
+    const key = String(name).toLowerCase().trim();
+    return CHAIN_ALIASES[key] || key.replace(/\s+/g, "-");
+  }
+
   const state = {
     paused: false,
     panel: null,
     listEl: null,
     summaryEl: null,
     statusEl: null,
-    debugEl: null,
     headerEl: null,
     observer: null,
     scanTimerId: 0,
@@ -95,25 +115,28 @@
     saveTimerId: 0,
     routeKey: "",
     lastScanAt: 0,
-    lastRowsFound: 0,
-    lastMintRowsFound: 0,
     settings: {
       windowMinutes: CONFIG.defaultWindowMinutes,
       minMints: CONFIG.defaultMinMints,
-      dimRepeats: true,
       onlyWithOffer: false,
       onlyOfferAboveMint: false,
       seenCollapsed: false
     },
     eventSeen: new Map(),
     collections: new Map(),
+    // Stats keyed by collection SLUG (that's what GraphQL takes as input).
     stats: new Map(),
     seen: new Map(),
     pulsed: new Set(),
-    fetchQueue: [],
+    fetchHeap: [], // Priority queue of { slug, priority, enqueuedAt }
+    fetchInQueue: new Map(), // slug → true, so we can update priorities in-place
     fetching: false,
     dirty: false,
-    updateAvailable: null, // { latestVersion, url } or null
+    updateAvailable: null,
+    // If OpenSea deploys a new frontend, our persistedQuery hash can start
+    // returning 400/404. We flip this flag on the first hard failure and
+    // stop the fetch queue until reload.
+    statsBroken: null, // null | { at, reason }
     drag: { active: false, startX: 0, startY: 0, startLeft: 0, startTop: 0 }
   };
 
@@ -153,6 +176,22 @@
   function slugFromCollectionUrl(url) {
     const m = pathFromUrl(url).match(/\/collection\/([^\/]+)/i);
     return m ? m[1] : null;
+  }
+
+  // Extract chain + contract address from an item URL like
+  // /assets/ethereum/0xabc.../123 or /assets/base/0xdef.../456.
+  // Contract addresses are the only stable per-collection identifier we can
+  // trust when scammers clone names.
+  function contractInfoFromItemUrl(url) {
+    const path = pathFromUrl(url);
+    // 0x address (EVM) — 40 hex chars.
+    const m = path.match(/\/(assets|asset|item|items|nft)\/([^\/]+)\/(0x[a-f0-9]{40})(?:\/|$)/i);
+    if (m) return { chainSlug: m[2], contract: m[3].toLowerCase() };
+    // Non-EVM fallback (Solana, etc): allow any non-slash id in the contract slot.
+    // We only trust it when preceded by an explicit chain identifier.
+    const m2 = path.match(/\/(assets|asset|item|items|nft)\/([^\/]+)\/([^\/]{8,})(?:\/|$)/i);
+    if (m2) return { chainSlug: m2[2], contract: m2[3].toLowerCase() };
+    return null;
   }
 
   function extractRelativeTimestamp(text) {
@@ -195,17 +234,11 @@
     return normalizeText(chunks.join(" "));
   }
 
-  function detectChain(fullText, row) {
+  function detectChainFromDom(fullText, row) {
     const accessible = collectAccessibleText(row);
     for (const chain of CHAIN_HINTS) if (chain.regex.test(accessible)) return chain.name;
     for (const chain of CHAIN_HINTS) if (chain.regex.test(fullText)) return chain.name;
-    return "Unknown";
-  }
-
-  function slugifySoft(text) {
-    return normalizeText(text).toLowerCase()
-      .replace(/[^a-z0-9а-яё]+/gi, "-")
-      .replace(/^-+|-+$/g, "").slice(0, 120);
+    return null;
   }
 
   function looksLikeMintRow(text) { return /\bmint\b/i.test(text); }
@@ -217,7 +250,6 @@
 
   // ==================== VERSION CHECK ====================
 
-  // Compare semver-ish strings like "0.4.1" vs "0.4.10". Returns >0, 0, <0.
   function compareVersions(a, b) {
     const pa = String(a).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
     const pb = String(b).replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -232,13 +264,10 @@
   function getInstalledVersion() {
     try {
       return (chrome && chrome.runtime && chrome.runtime.getManifest().version) || "0.0.0";
-    } catch (e) {
-      return "0.0.0";
-    }
+    } catch (e) { return "0.0.0"; }
   }
 
   async function checkForUpdate() {
-    // Skip if we checked recently.
     try {
       const raw = localStorage.getItem(CONFIG.updateCheckStorageKey);
       if (raw) {
@@ -255,26 +284,20 @@
 
     try {
       const res = await fetch(CONFIG.githubReleasesUrl, {
-        method: "GET",
-        headers: { accept: "application/vnd.github+json" }
+        method: "GET", headers: { accept: "application/vnd.github+json" }
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const latest = data && data.tag_name ? data.tag_name : null;
       if (!latest) return;
-
       const installed = getInstalledVersion();
       const isNewer = compareVersions(latest, installed) > 0;
       const updateAvailable = isNewer
         ? { latestVersion: latest, url: (data.html_url || CONFIG.repoUrl) }
         : null;
-
       localStorage.setItem(CONFIG.updateCheckStorageKey, JSON.stringify({
-        checkedAt: Date.now(),
-        installedAtCheck: installed,
-        updateAvailable
+        checkedAt: Date.now(), installedAtCheck: installed, updateAvailable
       }));
-
       state.updateAvailable = updateAvailable;
       renderPanel();
     } catch (err) {
@@ -291,7 +314,6 @@
       const text = normalizeText(el.innerText || "");
       if (!text || !looksLikeMintRow(text)) return;
       const cells = el.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
-      // Require ≥3 cells to skip header/summary rows.
       if (cells.length >= 3) set.add(el);
     });
 
@@ -368,7 +390,8 @@
     if (!collectionName) collectionName = "Unknown";
 
     return {
-      name: collectionName, title, subtitle, url: collectionUrl,
+      name: collectionName,
+      url: collectionUrl,
       itemUrl: itemAnchor ? canonicalUrl(itemAnchor.href) : null
     };
   }
@@ -393,6 +416,36 @@
     return extractRelativeTimestamp(row.innerText || "");
   }
 
+  // Build a stable collection key. Priority:
+  //   1. chain + contract address (from /assets/... URL) — safest, resistant to name spoofing.
+  //   2. slug (from /collection/... URL) — OpenSea guarantees slug uniqueness per chain.
+  //   3. no key → we skip the event entirely (better than merging scam clones under one card).
+  function buildCollectionKey(info, itemUrl, domChain) {
+    const contractInfo = itemUrl ? contractInfoFromItemUrl(itemUrl) : null;
+
+    if (contractInfo && contractInfo.contract) {
+      const chainCanon = canonicalizeChain(contractInfo.chainSlug) || canonicalizeChain(domChain) || "unknown";
+      return {
+        key: `contract::${chainCanon}::${contractInfo.contract}`,
+        chainCanon,
+        contract: contractInfo.contract,
+        slug: info.url ? slugFromCollectionUrl(info.url) : null
+      };
+    }
+
+    const slug = info.url ? slugFromCollectionUrl(info.url) : null;
+    if (slug) {
+      const chainCanon = canonicalizeChain(domChain) || "unknown";
+      return {
+        key: `slug::${chainCanon}::${slug}`,
+        chainCanon,
+        contract: null,
+        slug
+      };
+    }
+    return null;
+  }
+
   function extractEventMeta(row) {
     const rowText = normalizeText(row.innerText || "");
     if (!rowText || !looksLikeMintRow(rowText)) return null;
@@ -400,23 +453,26 @@
     const info = extractCollectionInfoFromRow(row);
     if (!info) return null;
 
-    const chain = detectChain(rowText, row);
+    const domChain = detectChainFromDom(rowText, row);
+    const keyInfo = buildCollectionKey(info, info.itemUrl, domChain);
+    if (!keyInfo) return null; // No contract, no slug → skip. Prevents scam name-clone merging.
+
     const price = extractPriceFromRow(row);
     const seenAt = extractTimeFromRow(row);
-    const slug = info.url ? slugFromCollectionUrl(info.url) : null;
-
-    const collectionKeyBase = slug || slugifySoft(info.name || "unknown");
-    const collectionKey = `${chain.toLowerCase()}::${collectionKeyBase}`;
 
     // 30s bucket dedupes "3m ago" → "4m ago" transitions for the same mint.
-    const itemUrl = info.itemUrl || "";
     const timeBucket = Math.round(seenAt / 30000);
-    const eventKey = `${collectionKey}|${itemUrl}|${timeBucket}`;
+    const eventKey = `${keyInfo.key}|${info.itemUrl || ""}|${timeBucket}`;
 
     return {
-      eventKey, collectionKey, slug,
+      eventKey,
+      collectionKey: keyInfo.key,
+      slug: keyInfo.slug,
+      contract: keyInfo.contract,
+      chainCanon: keyInfo.chainCanon,
+      chainDisplay: domChain || "Unknown",
       name: info.name || "Unknown",
-      chain, collectionUrl: info.url,
+      collectionUrl: info.url,
       itemUrl: info.itemUrl,
       price, seenAt
     };
@@ -429,21 +485,29 @@
     const isFirstTimeSeen = !col;
     if (!col) {
       col = {
-        key: meta.collectionKey, slug: meta.slug,
-        name: meta.name, chain: meta.chain,
-        collectionUrl: meta.collectionUrl, itemUrl: meta.itemUrl,
-        firstSeen: meta.seenAt, lastSeen: meta.seenAt,
+        key: meta.collectionKey,
+        slug: meta.slug,
+        contract: meta.contract,
+        chainCanon: meta.chainCanon,
+        chainDisplay: meta.chainDisplay,
+        name: meta.name,
+        collectionUrl: meta.collectionUrl,
+        itemUrl: meta.itemUrl,
+        firstSeen: meta.seenAt,
+        lastSeen: meta.seenAt,
         discoveredAt: Date.now(),
-        lastPrice: meta.price, events: []
+        lastPrice: meta.price,
+        events: []
       };
       state.collections.set(meta.collectionKey, col);
     }
 
     col.name = meta.name || col.name;
-    col.chain = meta.chain || col.chain;
+    col.chainDisplay = col.chainDisplay || meta.chainDisplay;
     col.collectionUrl = meta.collectionUrl || col.collectionUrl;
     col.itemUrl = meta.itemUrl || col.itemUrl;
     col.slug = col.slug || meta.slug;
+    col.contract = col.contract || meta.contract;
     col.lastSeen = Math.max(col.lastSeen, meta.seenAt);
     col.firstSeen = Math.min(col.firstSeen, meta.seenAt);
     if (meta.price) col.lastPrice = meta.price;
@@ -457,6 +521,48 @@
     state.dirty = true;
     if (col.slug) enqueueStatsFetch(col.slug);
     return isFirstTimeSeen;
+  }
+
+  // Migrate a collection to a new key. Used when GraphQL returns an authoritative
+  // chain identifier that differs from the DOM-guessed one, and we discover we
+  // have both "unknown::slug" and "base::slug" entries — merge them into the
+  // authoritative one so counts don't double.
+  function migrateCollectionKey(oldKey, newKey, authoritativeChainCanon, authoritativeChainDisplay) {
+    if (oldKey === newKey) return;
+    const oldCol = state.collections.get(oldKey);
+    if (!oldCol) return;
+
+    const target = state.collections.get(newKey);
+    if (!target) {
+      // Rename in place.
+      oldCol.key = newKey;
+      oldCol.chainCanon = authoritativeChainCanon;
+      oldCol.chainDisplay = authoritativeChainDisplay || oldCol.chainDisplay;
+      state.collections.delete(oldKey);
+      state.collections.set(newKey, oldCol);
+    } else {
+      // Merge events and prefer non-null fields.
+      target.events = target.events.concat(oldCol.events)
+        .sort((a, b) => a.ts - b.ts)
+        .slice(-CONFIG.maxEventsPerCollection);
+      target.firstSeen = Math.min(target.firstSeen, oldCol.firstSeen);
+      target.lastSeen = Math.max(target.lastSeen, oldCol.lastSeen);
+      target.discoveredAt = Math.min(target.discoveredAt, oldCol.discoveredAt);
+      target.name = target.name || oldCol.name;
+      target.collectionUrl = target.collectionUrl || oldCol.collectionUrl;
+      target.itemUrl = target.itemUrl || oldCol.itemUrl;
+      target.slug = target.slug || oldCol.slug;
+      target.contract = target.contract || oldCol.contract;
+      target.lastPrice = target.lastPrice || oldCol.lastPrice;
+      target.chainCanon = authoritativeChainCanon;
+      target.chainDisplay = authoritativeChainDisplay || target.chainDisplay;
+      state.collections.delete(oldKey);
+    }
+
+    // Carry pulsed/seen flags to the new key.
+    if (state.pulsed.has(oldKey)) { state.pulsed.delete(oldKey); state.pulsed.add(newKey); }
+    if (state.seen.has(oldKey))   { const ts = state.seen.get(oldKey); state.seen.delete(oldKey); state.seen.set(newKey, ts); saveSeen(); }
+    state.dirty = true;
   }
 
   function pruneByRetention() {
@@ -533,7 +639,9 @@
       const payload = {
         savedAt: Date.now(),
         collections: [...state.collections.values()].map((c) => ({
-          key: c.key, slug: c.slug, name: c.name, chain: c.chain,
+          key: c.key, slug: c.slug, contract: c.contract,
+          chainCanon: c.chainCanon, chainDisplay: c.chainDisplay,
+          name: c.name,
           collectionUrl: c.collectionUrl, itemUrl: c.itemUrl,
           firstSeen: c.firstSeen, lastSeen: c.lastSeen,
           discoveredAt: c.discoveredAt,
@@ -560,8 +668,12 @@
         const events = (c.events || []).filter((e) => e && e.ts >= cutoff);
         if (!events.length) return;
         state.collections.set(c.key, {
-          key: c.key, slug: c.slug || null,
-          name: c.name || "Unknown", chain: c.chain || "Unknown",
+          key: c.key,
+          slug: c.slug || null,
+          contract: c.contract || null,
+          chainCanon: c.chainCanon || null,
+          chainDisplay: c.chainDisplay || "Unknown",
+          name: c.name || "Unknown",
           collectionUrl: c.collectionUrl || null,
           itemUrl: c.itemUrl || null,
           firstSeen: events[0].ts, lastSeen: events[events.length - 1].ts,
@@ -583,32 +695,112 @@
     }
   }
 
-  // ==================== STATS FETCH ====================
+  // ==================== STATS FETCH (priority queue) ====================
+  // Priority score: higher = fetched sooner.
+  //   +1000 if brand-new (discoveredAt within freshDurationMs)
+  //   +100 * hotCount (mints in the last minute)
+  //   +1 if never fetched before
+  //   -age_minutes (older discoveries slide down)
+  function computeFetchPriority(slug) {
+    let score = 0;
+    const now = Date.now();
+    let bestCol = null;
+    for (const col of state.collections.values()) {
+      if (col.slug !== slug) continue;
+      if (!bestCol || col.discoveredAt > bestCol.discoveredAt) bestCol = col;
+    }
+    if (!bestCol) return 0;
+
+    if (now - bestCol.discoveredAt < CONFIG.freshDurationMs) score += 1000;
+    const { hotCount } = getMetrics(bestCol, now);
+    score += hotCount * 100;
+
+    const rec = state.stats.get(slug);
+    if (!rec || !rec.fetchedAt) score += 1;
+
+    const ageMinutes = (now - bestCol.discoveredAt) / 60000;
+    score -= ageMinutes;
+
+    return score;
+  }
+
+  function heapPush(item) {
+    state.fetchHeap.push(item);
+    // Simple sift-up on push, sift-down on pop. Heap is small in practice (<200),
+    // so O(n log n) full re-sort would also be fine — heap is future-proofing.
+    let i = state.fetchHeap.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (state.fetchHeap[parent].priority >= state.fetchHeap[i].priority) break;
+      [state.fetchHeap[parent], state.fetchHeap[i]] = [state.fetchHeap[i], state.fetchHeap[parent]];
+      i = parent;
+    }
+  }
+
+  function heapPop() {
+    if (!state.fetchHeap.length) return null;
+    const top = state.fetchHeap[0];
+    const last = state.fetchHeap.pop();
+    if (state.fetchHeap.length) {
+      state.fetchHeap[0] = last;
+      let i = 0;
+      const n = state.fetchHeap.length;
+      while (true) {
+        const l = i * 2 + 1, r = i * 2 + 2;
+        let largest = i;
+        if (l < n && state.fetchHeap[l].priority > state.fetchHeap[largest].priority) largest = l;
+        if (r < n && state.fetchHeap[r].priority > state.fetchHeap[largest].priority) largest = r;
+        if (largest === i) break;
+        [state.fetchHeap[i], state.fetchHeap[largest]] = [state.fetchHeap[largest], state.fetchHeap[i]];
+        i = largest;
+      }
+    }
+    return top;
+  }
 
   function enqueueStatsFetch(slug) {
     if (!slug) return;
+    if (state.statsBroken) return; // Do not pile up requests to a broken endpoint.
+
     const existing = state.stats.get(slug);
     const now = Date.now();
 
     if (existing) {
-      const age = now - (existing.fetchedAt || 0);
       if (existing.loading) return;
+      const age = now - (existing.fetchedAt || 0);
       if (existing.ok && age < CONFIG.statsRefreshMs) return;
       if (!existing.ok && age < CONFIG.statsFailRetryMs) return;
     } else {
       state.stats.set(slug, { loading: true, ok: false, fetchedAt: 0 });
     }
 
-    if (!state.fetchQueue.includes(slug)) state.fetchQueue.push(slug);
+    const priority = computeFetchPriority(slug);
+    if (state.fetchInQueue.has(slug)) {
+      // Update in-place: replace the entry, then re-heapify by rebuilding.
+      // For our sizes this is cheap and simpler than a decrease-key routine.
+      for (let i = 0; i < state.fetchHeap.length; i += 1) {
+        if (state.fetchHeap[i].slug === slug) { state.fetchHeap[i].priority = priority; break; }
+      }
+      state.fetchHeap.sort((a, b) => b.priority - a.priority);
+    } else {
+      state.fetchInQueue.set(slug, true);
+      heapPush({ slug, priority, enqueuedAt: now });
+    }
+
     runFetchQueue();
   }
 
   async function runFetchQueue() {
     if (state.fetching) return;
+    if (state.statsBroken) return;
     state.fetching = true;
 
-    while (state.fetchQueue.length) {
-      const slug = state.fetchQueue.shift();
+    while (state.fetchHeap.length && !state.statsBroken) {
+      const top = heapPop();
+      if (!top) break;
+      const slug = top.slug;
+      state.fetchInQueue.delete(slug);
+
       try {
         const record = state.stats.get(slug) || {};
         record.loading = true;
@@ -618,15 +810,52 @@
         const parsed = parseCollectionStats(raw);
 
         state.stats.set(slug, { loading: false, ok: true, fetchedAt: Date.now(), data: parsed });
+
+        // Reconcile chain: if GraphQL knows a chain we didn't guess correctly,
+        // migrate the key so counts are not split.
+        if (parsed && parsed.chainId) {
+          const authoritativeCanon = canonicalizeChain(parsed.chainId) || canonicalizeChain(parsed.chainName);
+          if (authoritativeCanon) {
+            for (const col of [...state.collections.values()]) {
+              if (col.slug !== slug) continue;
+              if (col.chainCanon === authoritativeCanon) continue;
+              const rest = col.key.split("::").slice(1).join("::"); // drop the prefix::chain segment
+              // rest is "oldChain::identifier" — replace only the chain part.
+              const parts = col.key.split("::");
+              if (parts.length >= 3) {
+                parts[1] = authoritativeCanon;
+                const newKey = parts.join("::");
+                migrateCollectionKey(col.key, newKey, authoritativeCanon, parsed.chainName || col.chainDisplay);
+              }
+            }
+          }
+        }
+
         renderPanel();
       } catch (err) {
         console.warn(LOG_PREFIX, "stats fetch failed for", slug, err);
-        state.stats.set(slug, { loading: false, ok: false, fetchedAt: Date.now(), error: String(err && err.message || err) });
+        const msg = String(err && err.message || err);
+        state.stats.set(slug, { loading: false, ok: false, fetchedAt: Date.now(), error: msg });
+
+        if (isHashBrokenError(msg)) {
+          state.statsBroken = { at: Date.now(), reason: msg };
+          log("persisted query looks broken, halting stats queue");
+          renderPanel();
+          break;
+        }
       }
       await new Promise((r) => setTimeout(r, CONFIG.fetchGapMs));
     }
 
     state.fetching = false;
+  }
+
+  // Detect the two common ways OpenSea's GraphQL rejects a stale persisted-query hash:
+  //   - HTTP 400/404 on the request itself
+  //   - HTTP 200 with an error "PersistedQueryNotFound"
+  // Any of these means our hash needs to be updated in CONFIG.tooltipQueryHash.
+  function isHashBrokenError(msg) {
+    return /HTTP\s+40[0-4]/i.test(msg) || /PersistedQueryNotFound/i.test(msg);
   }
 
   async function fetchCollectionStats(slug) {
@@ -643,7 +872,13 @@
     });
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+    const json = await res.json();
+    // GraphQL persisted-query error surface: check top-level errors[].
+    if (json && Array.isArray(json.errors) && json.errors.length) {
+      const firstMsg = json.errors[0].message || "GraphQL error";
+      throw new Error(firstMsg);
+    }
+    return json;
   }
 
   function parsePriceObj(obj) {
@@ -796,6 +1031,7 @@
         <div>
           <div class="osmm-title-row">
             <span class="osmm-title">OpenSea Mint Monitor</span>
+            <span class="osmm-status-slot"></span>
             <span class="osmm-update-slot"></span>
           </div>
           <div class="osmm-subtitle">
@@ -812,10 +1048,6 @@
         <div class="osmm-controls">
           <button class="osmm-btn" data-action="pause" type="button">Pause</button>
           <button class="osmm-btn" data-action="clear" type="button">Clear</button>
-          <label class="osmm-check">
-            <input type="checkbox" data-setting="dimRepeats" ${state.settings.dimRepeats ? "checked" : ""} />
-            dim repeats
-          </label>
         </div>
         <div class="osmm-controls osmm-controls-compact">
           <label title="How many minutes of history to keep and display">
@@ -840,7 +1072,6 @@
         </div>
         <div class="osmm-summary"></div>
         <div class="osmm-status"></div>
-        <div class="osmm-summary" data-role="debug" style="color:#ffbf69"></div>
         <div class="osmm-list"></div>
       </div>
     `;
@@ -850,9 +1081,8 @@
     state.panel = panel;
     state.headerEl = panel.querySelector('[data-role="drag-handle"]');
     state.listEl = panel.querySelector(".osmm-list");
-    state.summaryEl = panel.querySelector(".osmm-summary:not([data-role='debug'])");
+    state.summaryEl = panel.querySelector(".osmm-summary");
     state.statusEl = panel.querySelector(".osmm-status");
-    state.debugEl = panel.querySelector('[data-role="debug"]');
 
     const saved = loadSavedPosition();
     if (saved) applyPosition(saved.left, saved.top); else snapTopRight();
@@ -860,7 +1090,6 @@
     state.headerEl.addEventListener("mousedown", onDragStart);
 
     panel.addEventListener("click", (e) => {
-      // Clicks on "open collection" mark the collection as seen.
       const openLink = e.target.closest("a[data-role='open-collection']");
       if (openLink) {
         const key = openLink.dataset.collectionKey;
@@ -937,6 +1166,8 @@
     if (last !== state.panel) document.documentElement.appendChild(state.panel);
   }
 
+  // Grouping-by-collection is always on. We still dim duplicate rows in the
+  // native OpenSea feed so the eye can skim the page underneath the panel.
   function annotateVisibleRows() {
     const rows = [...document.querySelectorAll('[data-osmm-row="1"]')];
     const firstByCollection = new Set();
@@ -952,10 +1183,8 @@
       const metrics = getMetrics(col, now);
       if (metrics.hotCount >= 3) row.classList.add("osmm-hot-row");
 
-      if (state.settings.dimRepeats) {
-        if (firstByCollection.has(key)) row.classList.add("osmm-dim-repeat");
-        else firstByCollection.add(key);
-      }
+      if (firstByCollection.has(key)) row.classList.add("osmm-dim-repeat");
+      else firstByCollection.add(key);
     });
   }
 
@@ -980,28 +1209,45 @@
     return true;
   }
 
-  function renderUpdateSlot() {
+  function renderHeaderSlots() {
     if (!state.panel) return;
-    const slot = state.panel.querySelector(".osmm-update-slot");
-    if (!slot) return;
-    if (state.updateAvailable) {
-      slot.innerHTML = `
-        <a class="osmm-update-badge"
-           href="${escapeHtml(state.updateAvailable.url)}"
-           target="_blank" rel="noopener noreferrer"
-           title="New version ${escapeHtml(state.updateAvailable.latestVersion)} available (installed ${escapeHtml(getInstalledVersion())})">
-          ↑ update
-        </a>
-      `;
-    } else {
-      slot.innerHTML = "";
+
+    const statusSlot = state.panel.querySelector(".osmm-status-slot");
+    if (statusSlot) {
+      if (state.statsBroken) {
+        statusSlot.innerHTML = `
+          <a class="osmm-status-badge osmm-status-broken"
+             href="${escapeHtml(CONFIG.repoUrl)}" target="_blank" rel="noopener noreferrer"
+             title="OpenSea GraphQL rejected our persisted-query hash. The hash likely needs to be updated. Click to open the repo for an updated release.">
+            ! stats broken
+          </a>
+        `;
+      } else {
+        statusSlot.innerHTML = "";
+      }
+    }
+
+    const updateSlot = state.panel.querySelector(".osmm-update-slot");
+    if (updateSlot) {
+      if (state.updateAvailable) {
+        updateSlot.innerHTML = `
+          <a class="osmm-update-badge"
+             href="${escapeHtml(state.updateAvailable.url)}"
+             target="_blank" rel="noopener noreferrer"
+             title="New version ${escapeHtml(state.updateAvailable.latestVersion)} available (installed ${escapeHtml(getInstalledVersion())})">
+            ↑ update
+          </a>
+        `;
+      } else {
+        updateSlot.innerHTML = "";
+      }
     }
   }
 
   function renderPanel() {
     if (!state.panel) return;
 
-    renderUpdateSlot();
+    renderHeaderSlots();
 
     const now = Date.now();
     const retention = getRetentionMs();
@@ -1027,9 +1273,7 @@
 
     state.statusEl.textContent = state.paused
       ? "paused"
-      : `live · last scan ${state.lastScanAt ? formatAgo(state.lastScanAt, now) : "now"} ago · fetch queue: ${state.fetchQueue.length}`;
-
-    state.debugEl.textContent = `debug: candidate rows=${state.lastRowsFound}, mint rows=${state.lastMintRowsFound}`;
+      : `live · last scan ${state.lastScanAt ? formatAgo(state.lastScanAt, now) : "now"} ago · fetch queue: ${state.fetchHeap.length}`;
 
     if (!newCards.length && !seenCards.length) {
       state.listEl.innerHTML = `
@@ -1096,12 +1340,13 @@
     const mintingBadge = stats && stats.isMinting ? " · <b>minting</b>" : "";
     const effectiveMint = getEffectiveMintPrice(col, stats);
     const mintPriceStr = effectiveMint !== null ? `${effectiveMint}` : (col.lastPrice ? formatPrice(col.lastPrice) : "—");
+    const chainDisplay = (stats && stats.chainName) || col.chainDisplay || "Unknown";
 
     return `
       <div class="${classes.join(" ")}">
         <div class="osmm-card-top">
           <div class="osmm-name">${escapeHtml(col.name || "Unknown")}${verified}${newBadge}</div>
-          <div class="osmm-chain">${escapeHtml((stats && stats.chainName) || col.chain || "Unknown")}</div>
+          <div class="osmm-chain">${escapeHtml(chainDisplay)}</div>
         </div>
         <div class="osmm-metrics">
           <span>1m: <b>${metrics.hotCount}</b></span>
@@ -1134,14 +1379,10 @@
     ensurePanelOnTop();
 
     const rows = collectRowCandidates();
-    state.lastRowsFound = rows.length;
-
-    let mintRows = 0;
 
     for (const row of rows) {
       const meta = extractEventMeta(row);
       if (!meta) continue;
-      mintRows += 1;
 
       row.dataset.osmmRow = "1";
       row.dataset.osmmCollectionKey = meta.collectionKey;
@@ -1153,16 +1394,11 @@
       addEvent(meta);
     }
 
-    state.lastMintRowsFound = mintRows;
-
     pruneByRetention();
     annotateVisibleRows();
 
     state.lastScanAt = Date.now();
     renderPanel();
-
-    log("scan:", "rows=" + rows.length, "mint=" + mintRows,
-        "collections=" + state.collections.size);
   }
 
   function scheduleScanSoon() {
@@ -1193,10 +1429,6 @@
     scanPage();
   }
 
-  // Only the /activity page should ever render the panel. This is enforced by
-  // the manifest match patterns, but we double-check inside the script so
-  // that a) URL edge cases like /activity/something never trigger us, and
-  // b) if the user navigates away via SPA routing, the panel disappears.
   function isActivityPage() {
     return location.pathname === "/activity";
   }
@@ -1209,7 +1441,6 @@
     state.listEl = null;
     state.summaryEl = null;
     state.statusEl = null;
-    state.debugEl = null;
     state.headerEl = null;
   }
 

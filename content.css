@@ -37,7 +37,7 @@
   cursor: move;
 }
 #osmm-panel .osmm-title-row {
-  display: inline-flex; align-items: center; gap: 8px;
+  display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
   font-size: 14px; font-weight: 700; line-height: 1.2;
 }
 #osmm-panel .osmm-title { font-size: 14px; font-weight: 700; }
@@ -60,6 +60,23 @@
 #osmm-panel .osmm-update-badge:hover {
   background: rgba(255, 196, 0, 0.32);
   color: #fff2b8;
+}
+
+#osmm-panel .osmm-status-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.05em;
+  text-decoration: none;
+  transition: 0.15s ease;
+}
+#osmm-panel .osmm-status-broken {
+  background: rgba(255, 90, 90, 0.18);
+  color: #ffbdbd;
+  border: 1px solid rgba(255, 90, 90, 0.5);
+}
+#osmm-panel .osmm-status-broken:hover {
+  background: rgba(255, 90, 90, 0.3);
+  color: #ffe0e0;
 }
 
 #osmm-panel .osmm-header-actions { display: flex; gap: 6px; }
