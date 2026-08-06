@@ -126,6 +126,11 @@
     collections: new Map(),
     // Stats keyed by collection SLUG (that's what GraphQL takes as input).
     stats: new Map(),
+    // NEW: remembers "collection slug X lives at contract Y on chain Z".
+    // Filled from every row that has both a /collection/ link and an
+    // /assets/<chain>/<contract>/... link. Used to merge slug-keyed and
+    // contract-keyed entries for the same collection.
+    slugToContract: new Map(), // slug → { chainCanon, contract }
     seen: new Map(),
     pulsed: new Set(),
     fetchHeap: [], // Priority queue of { slug, priority, enqueuedAt }
@@ -418,23 +423,41 @@
 
   // Build a stable collection key. Priority:
   //   1. chain + contract address (from /assets/... URL) — safest, resistant to name spoofing.
-  //   2. slug (from /collection/... URL) — OpenSea guarantees slug uniqueness per chain.
-  //   3. no key → we skip the event entirely (better than merging scam clones under one card).
+  //   2. If we've already seen this slug paired with a contract, reuse the contract key.
+  //   3. slug (from /collection/... URL) — OpenSea guarantees slug uniqueness per chain.
+  //   4. no key → we skip the event entirely.
   function buildCollectionKey(info, itemUrl, domChain) {
     const contractInfo = itemUrl ? contractInfoFromItemUrl(itemUrl) : null;
+    const slug = info.url ? slugFromCollectionUrl(info.url) : null;
 
+    // Case 1: contract found directly in this row.
     if (contractInfo && contractInfo.contract) {
       const chainCanon = canonicalizeChain(contractInfo.chainSlug) || canonicalizeChain(domChain) || "unknown";
+      // Remember slug → contract for future slug-only rows of the same collection.
+      if (slug) {
+        state.slugToContract.set(slug, { chainCanon, contract: contractInfo.contract });
+      }
       return {
         key: `contract::${chainCanon}::${contractInfo.contract}`,
         chainCanon,
         contract: contractInfo.contract,
-        slug: info.url ? slugFromCollectionUrl(info.url) : null
+        slug
       };
     }
 
-    const slug = info.url ? slugFromCollectionUrl(info.url) : null;
+    // Case 2: no contract in this row, but we've previously mapped this slug.
     if (slug) {
+      const known = state.slugToContract.get(slug);
+      if (known && known.contract) {
+        return {
+          key: `contract::${known.chainCanon}::${known.contract}`,
+          chainCanon: known.chainCanon,
+          contract: known.contract,
+          slug
+        };
+      }
+      // Case 3: slug-only key. Will get upgraded once we see the same
+      // collection with a contract-bearing row (mergeSlugKeyedDuplicates).
       const chainCanon = canonicalizeChain(domChain) || "unknown";
       return {
         key: `slug::${chainCanon}::${slug}`,
@@ -443,6 +466,7 @@
         slug
       };
     }
+
     return null;
   }
 
@@ -563,6 +587,24 @@
     if (state.pulsed.has(oldKey)) { state.pulsed.delete(oldKey); state.pulsed.add(newKey); }
     if (state.seen.has(oldKey))   { const ts = state.seen.get(oldKey); state.seen.delete(oldKey); state.seen.set(newKey, ts); saveSeen(); }
     state.dirty = true;
+  }
+
+  // Walk all collections and merge any "slug::chain::slug" entry into its
+  // "contract::chain::contract" counterpart if we now know the contract.
+  // Runs on every scan; cheap because state.collections is small.
+  function mergeSlugKeyedDuplicates() {
+    for (const col of [...state.collections.values()]) {
+      // Only slug-keyed entries can be upgraded.
+      if (!col.key.startsWith("slug::")) continue;
+      if (!col.slug) continue;
+      const known = state.slugToContract.get(col.slug);
+      if (!known || !known.contract) continue;
+
+      const newKey = `contract::${known.chainCanon}::${known.contract}`;
+      if (newKey === col.key) continue;
+
+      migrateCollectionKey(col.key, newKey, known.chainCanon, col.chainDisplay);
+    }
   }
 
   function pruneByRetention() {
@@ -1394,7 +1436,8 @@
       addEvent(meta);
     }
 
-    pruneByRetention();
+    mergeSlugKeyedDuplicates();
+	pruneByRetention();
     annotateVisibleRows();
 
     state.lastScanAt = Date.now();
