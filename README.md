@@ -100,7 +100,7 @@ opensea-mint-monitor/
 ## Known limitations
 
 - **OpenSea layout changes** may break DOM parsing. If the panel stops picking up mints, open DevTools (F12) → Console — you will see `[OSMM] scan:` logs indicating whether rows are being found.
-- **GraphQL hash** — OpenSea's persisted-query hash for the tooltip may change over time. If floor/offer data stops loading, the hash needs to be updated in `content.js` under `CONFIG.tooltipQueryHash`. To find the new hash: open DevTools → Network → hover any collection → find the `CollectionPreviewTooltipContentQuery` request and copy the `sha256Hash` from its URL.
+- **GraphQL hash** — OpenSea's persisted-query hash for the tooltip may change over time when OpenSea deploys a new frontend. When that happens the extension shows a red **! stats broken** badge in the header, and floor/offer data will not load until a new release. To fix locally: open DevTools → Network → hover any collection → find the `CollectionPreviewTooltipContentQuery` request → copy the `sha256Hash` from its URL → replace the value of `CONFIG.tooltipQueryHash` in `content.js`.
 - The extension currently reads only what OpenSea itself renders and exposes via its own API. It does not query blockchains directly.
 
 ## Roadmap ideas
