@@ -12,9 +12,9 @@ Instead of watching hundreds of individual NFTs scroll past, you see a compact s
 
 The panel is draggable, always on top, and its history survives page refreshes.
 
-## Screenshots
+## Screenshot
 
-<img width="1860" height="525" alt="image" src="https://github.com/user-attachments/assets/91d610f5-1ada-498a-8c58-bf02f0fd4c7e" />
+<img width="1868" height="951" alt="image" src="https://github.com/user-attachments/assets/82c5b177-87ba-4050-b37a-2a863966a8e8" />
 
 ## Why
 
