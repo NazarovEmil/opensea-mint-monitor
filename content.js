@@ -43,7 +43,7 @@
     // OpenSea GraphQL endpoint.
     graphqlUrl: "https://gql.opensea.io/graphql",
     tooltipQueryName: "CollectionPreviewTooltipContentQuery",
-    tooltipQueryHash: "761282bbf059601b6b02e7c6061a4be4f7958d28a3b386a1305295d9b1d2fd81",
+    tooltipQueryHash: "c482f97837ee92c2943b770b704f5f0ad95728261f900c84fd2b76c393de7347",
 
     // Rate limits for the stats fetcher.
     fetchGapMs: 400,
@@ -1261,7 +1261,7 @@
           <a class="osmm-status-badge osmm-status-broken"
              href="${escapeHtml(CONFIG.repoUrl)}" target="_blank" rel="noopener noreferrer"
              title="OpenSea GraphQL rejected our persisted-query hash. The hash likely needs to be updated. Click to open the repo for an updated release.">
-            ! stats broken
+            ! outdated. Update required
           </a>
         `;
       } else {
@@ -1277,7 +1277,7 @@
              href="${escapeHtml(state.updateAvailable.url)}"
              target="_blank" rel="noopener noreferrer"
              title="New version ${escapeHtml(state.updateAvailable.latestVersion)} available (installed ${escapeHtml(getInstalledVersion())})">
-            ↑ update
+            ↑ new version
           </a>
         `;
       } else {
