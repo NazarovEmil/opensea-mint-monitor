@@ -1,16 +1,13 @@
 {
   "manifest_version": 3,
   "name": "OpenSea Mint Monitor",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Groups OpenSea live mint activity by collection with live floor/offer data. Highlights brand-new collections and separates them from ones you already opened.",
   "author": "Emil Nazarov",
   "homepage_url": "https://github.com/NazarovEmil/opensea-mint-monitor",
   "content_scripts": [
     {
-      "matches": [
-        "https://opensea.io/activity",
-        "https://opensea.io/activity?*"
-      ],
+      "matches": ["https://opensea.io/*"],
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_idle"
